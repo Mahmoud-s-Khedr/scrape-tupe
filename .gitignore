@@ -1,0 +1,32 @@
+# Binaries
+master
+downloader
+normalizer
+
+# Database
+*.db
+*.db-wal
+*.db-shm
+
+# Go build
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp downloads
+/tmp/

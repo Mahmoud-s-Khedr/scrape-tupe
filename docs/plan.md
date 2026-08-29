@@ -232,7 +232,7 @@ The Bunny overview API reports both `activeInstances` and `desiredInstances`, so
 | Phase       | Deliverable                                   | Key Milestone                                         | Status   |
 | ----------- | --------------------------------------------- | ----------------------------------------------------- | -------- |
 | **Phase 1** | SQLite schema + Master HTTP API               | Master starts, serves endpoints, reads/writes DB      | ✅ Done  |
-| **Phase 2** | Single local downloader with yt-dlp           | One video downloaded end-to-end locally                | ⬜       |
+| **Phase 2** | Single local downloader with yt-dlp           | One video downloaded end-to-end locally                | ✅ Done  |
 | **Phase 3** | Bunny Storage upload integration              | Downloaded video lands in Bunny Storage                | ⬜       |
 | **Phase 4** | Normalizer (channel/playlist/video expansion) | Test dataset fully expanded into `videos` table        | ⬜       |
 | **Phase 5** | Leases & heartbeats                           | Simulated crash → lease expires → job re-queued        | ⬜       |
@@ -255,6 +255,27 @@ The Bunny overview API reports both `activeInstances` and `desiredInstances`, so
 > 5. Master undeploy the downloader application.
 >
 > **This single demo proves essentially the whole architecture.**
+
+## Progress Log
+
+### Phase 1 — SQLite schema + Master HTTP API ✅
+
+- Created SQLite schema (`internal/db/schema.sql`) with `sources`, `videos`, and `workers` tables.
+- Built database layer (`internal/db/`) with full CRUD, job claiming, lease management, and state tracking.
+- Implemented Master HTTP API (`internal/master/`) with all endpoints:
+  - Sources: `POST /sources`, `GET /sources`, `GET /sources/{id}`
+  - Videos: `GET /videos`, `GET /videos/{id}`
+  - Workers: `POST /workers/register`, `POST /workers/heartbeat`, `GET /workers`
+  - Jobs: `POST /jobs/claim`, `POST /jobs/{id}/state`, `POST /jobs/{id}/complete`, `POST /jobs/{id}/renew`
+  - Stats/Health: `GET /stats`, `GET /health`
+
+### Phase 2 — Single local downloader with yt-dlp ✅
+
+- Implemented downloader worker (`internal/downloader/downloader.go`):
+  - Registers with master, claims jobs in a loop, runs yt-dlp, sends heartbeats + lease renewals.
+  - Handles SIGTERM/SIGINT for graceful shutdown.
+- Built CLI entry point (`cmd/downloader/main.go`) with flags for master URL, worker ID, output dir.
+- **Tested end-to-end** with video `3YSxCEGddVU` — downloaded successfully to `/tmp/scrape-tupe/downloads/job-1/3YSxCEGddVU.mkv` (6.3 MB).
 
 ---
 
