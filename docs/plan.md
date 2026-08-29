@@ -229,18 +229,18 @@ The Bunny overview API reports both `activeInstances` and `desiredInstances`, so
 
 ## Build Order
 
-| Phase       | Deliverable                                   | Key Milestone                                         |
-| ----------- | --------------------------------------------- | ----------------------------------------------------- |
-| **Phase 1** | SQLite schema + Master HTTP API               | Master starts, serves endpoints, reads/writes DB      |
-| **Phase 2** | Single local downloader with yt-dlp           | One video downloaded end-to-end locally                |
-| **Phase 3** | Bunny Storage upload integration              | Downloaded video lands in Bunny Storage                |
-| **Phase 4** | Normalizer (channel/playlist/video expansion) | Test dataset fully expanded into `videos` table        |
-| **Phase 5** | Leases & heartbeats                           | Simulated crash → lease expires → job re-queued        |
-| **Phase 6** | Dockerize the downloader                      | Container image runs and completes one job             |
-| **Phase 7** | Deploy one Bunny worker                       | Single Magic Container replica processes jobs          |
-| **Phase 8** | Test 2–3 replicas manually                    | Multiple workers drain the queue in parallel           |
-| **Phase 9** | Connect Bunny API to master                   | Master reads `activeInstances` / `desiredInstances`    |
-| **Phase 10**| Automatic scale-up / undeploy logic           | Full autoscaling loop operational                      |
+| Phase       | Deliverable                                   | Key Milestone                                         | Status   |
+| ----------- | --------------------------------------------- | ----------------------------------------------------- | -------- |
+| **Phase 1** | SQLite schema + Master HTTP API               | Master starts, serves endpoints, reads/writes DB      | ✅ Done  |
+| **Phase 2** | Single local downloader with yt-dlp           | One video downloaded end-to-end locally                | ⬜       |
+| **Phase 3** | Bunny Storage upload integration              | Downloaded video lands in Bunny Storage                | ⬜       |
+| **Phase 4** | Normalizer (channel/playlist/video expansion) | Test dataset fully expanded into `videos` table        | ⬜       |
+| **Phase 5** | Leases & heartbeats                           | Simulated crash → lease expires → job re-queued        | ⬜       |
+| **Phase 6** | Dockerize the downloader                      | Container image runs and completes one job             | ⬜       |
+| **Phase 7** | Deploy one Bunny worker                       | Single Magic Container replica processes jobs          | ⬜       |
+| **Phase 8** | Test 2–3 replicas manually                    | Multiple workers drain the queue in parallel           | ⬜       |
+| **Phase 9** | Connect Bunny API to master                   | Master reads `activeInstances` / `desiredInstances`    | ⬜       |
+| **Phase 10**| Automatic scale-up / undeploy logic           | Full autoscaling loop operational                      | ⬜       |
 
 ---
 
