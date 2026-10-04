@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,24 +12,55 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
+// ErrNoPendingJobs is returned when the master has no job to lease.
+var ErrNoPendingJobs = errors.New("no pending jobs")
+
+// ErrLeaseConflict means the master rejected a worker operation because the
+// job's lease is no longer owned by this worker.
+var ErrLeaseConflict = errors.New("job lease conflict")
+
+// HTTPStatusError preserves the master response when an HTTP request fails.
+// It deliberately includes the response body because master errors are useful
+// operational context for short-lived Cloud Run Job tasks.
+type HTTPStatusError struct {
+	StatusCode int
+	Status     string
+	Body       string
+}
+
+func (e *HTTPStatusError) Error() string {
+	if e.Body == "" {
+		return fmt.Sprintf("master request failed: %s", e.Status)
+	}
+	return fmt.Sprintf("master request failed: %s: %s", e.Status, e.Body)
+}
+
+func (e *HTTPStatusError) Is(target error) bool {
+	return target == ErrLeaseConflict && e.StatusCode == http.StatusConflict
+}
+
 // Video mirrors the master's video response.
 type Video struct {
-	ID        int64  `json:"id"`
-	YoutubeID string `json:"youtube_id"`
+	ID        int64   `json:"id"`
+	YoutubeID string  `json:"youtube_id"`
 	Title     *string `json:"title,omitempty"`
-	State     string `json:"state"`
+	State     string  `json:"state"`
 }
 
 // Config holds the downloader configuration.
 type Config struct {
-	MasterURL     string        // Base URL of the master server (e.g. http://localhost:8080)
-	WorkerID      string        // Unique identifier for this worker
-	LeaseDuration time.Duration // How long the lease lasts (default 5m)
-	HeartbeatFreq time.Duration // How often to send heartbeats (default 30s)
-	OutputDir     string        // Base directory for downloaded files
+	MasterURL      string        // Base URL of the master server (e.g. http://localhost:8080)
+	WorkerID       string        // Unique identifier for this worker
+	LeaseDuration  time.Duration // How long the lease lasts (default 5m)
+	HeartbeatFreq  time.Duration // How often to send heartbeats (default 30s)
+	OutputDir      string        // Base directory for downloaded files
+	Uploader       Uploader      // Upload strategy (GCS, local filesystem, or noop)
+	CleanupTempDir bool          // Whether to delete temp dir after successful upload
+	ExitWhenEmpty  bool          // Exit successfully instead of polling when the queue is empty
 }
 
 // Worker is a single-video downloader that pulls jobs from the master.
@@ -40,6 +72,9 @@ type Worker struct {
 
 // New creates a new downloader worker.
 func New(cfg Config, logger *slog.Logger) *Worker {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if cfg.LeaseDuration == 0 {
 		cfg.LeaseDuration = 5 * time.Minute
 	}
@@ -48,6 +83,9 @@ func New(cfg Config, logger *slog.Logger) *Worker {
 	}
 	if cfg.OutputDir == "" {
 		cfg.OutputDir = "/tmp/scrape-tupe/downloads"
+	}
+	if cfg.Uploader == nil {
+		cfg.Uploader = NewNoopUploader(logger)
 	}
 	return &Worker{
 		cfg:    cfg,
@@ -75,6 +113,10 @@ func (w *Worker) Run(ctx context.Context) error {
 
 		video, err := w.claimJob(ctx)
 		if err != nil {
+			if errors.Is(err, ErrNoPendingJobs) && w.cfg.ExitWhenEmpty {
+				w.logger.Info("no pending jobs; bounded worker exiting")
+				return nil
+			}
 			w.logger.Info("no pending jobs, waiting 5s before retrying", "error", err)
 			select {
 			case <-ctx.Done():
@@ -91,6 +133,13 @@ func (w *Worker) Run(ctx context.Context) error {
 		)
 
 		if err := w.processJob(ctx, video); err != nil {
+			if errors.Is(err, ErrLeaseConflict) {
+				w.logger.Warn("job lease lost; leaving it for recovery or its new owner",
+					"job_id", video.ID,
+					"youtube_id", video.YoutubeID,
+				)
+				continue
+			}
 			w.logger.Error("job failed",
 				"job_id", video.ID,
 				"youtube_id", video.YoutubeID,
@@ -117,14 +166,13 @@ func (w *Worker) claimJob(ctx context.Context) (*Video, error) {
 	}
 	resp, err := w.postJSON(ctx, "/jobs/claim", body)
 	if err != nil {
+		var statusErr *HTTPStatusError
+		if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusNotFound {
+			return nil, ErrNoPendingJobs
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("claim failed: %s %s", resp.Status, string(b))
-	}
 
 	var video Video
 	if err := json.NewDecoder(resp.Body).Decode(&video); err != nil {
@@ -133,7 +181,7 @@ func (w *Worker) claimJob(ctx context.Context) (*Video, error) {
 	return &video, nil
 }
 
-// processJob downloads a single video using yt-dlp.
+// processJob downloads a single video using yt-dlp and uploads it.
 func (w *Worker) processJob(ctx context.Context, video *Video) error {
 	// Update state to downloading
 	if err := w.updateJobState(ctx, video.ID, "downloading", nil); err != nil {
@@ -145,16 +193,44 @@ func (w *Worker) processJob(ctx context.Context, video *Video) error {
 	if err := os.MkdirAll(jobDir, 0o755); err != nil {
 		return fmt.Errorf("failed to create job dir: %w", err)
 	}
+	if w.cfg.CleanupTempDir {
+		defer func() {
+			if err := os.RemoveAll(jobDir); err != nil {
+				w.logger.Warn("failed to clean up job dir", "dir", jobDir, "error", err)
+			}
+		}()
+	}
 
 	// Start heartbeat goroutine
-	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
-	defer heartbeatCancel()
-	go w.heartbeatLoop(heartbeatCtx, video.ID)
+	jobCtx, jobCancel := context.WithCancel(ctx)
+	defer jobCancel()
+	leaseLost := make(chan struct{})
+	var markLeaseLost sync.Once
+	go w.heartbeatLoopWithLeaseLoss(jobCtx, video.ID, func() {
+		markLeaseLost.Do(func() {
+			close(leaseLost)
+			jobCancel()
+		})
+	})
+	hasLostLease := func() bool {
+		select {
+		case <-leaseLost:
+			return true
+		default:
+			return false
+		}
+	}
 
 	// Run yt-dlp
-	outputPath, err := w.runYTDLP(ctx, video.YoutubeID, jobDir)
+	outputPath, err := w.runYTDLP(jobCtx, video.YoutubeID, jobDir)
 	if err != nil {
+		if hasLostLease() {
+			return ErrLeaseConflict
+		}
 		return fmt.Errorf("yt-dlp failed: %w", err)
+	}
+	if hasLostLease() {
+		return ErrLeaseConflict
 	}
 
 	w.logger.Info("download complete",
@@ -163,17 +239,37 @@ func (w *Worker) processJob(ctx context.Context, video *Video) error {
 		"output_path", outputPath,
 	)
 
-	// Phase 3 will add Bunny Storage upload here.
-	// For now, mark as completed with local path as storage_path.
-	if err := w.completeJob(ctx, video.ID, outputPath); err != nil {
+	// Upload to storage
+	if err := w.updateJobState(jobCtx, video.ID, "uploading", nil); err != nil {
+		return fmt.Errorf("failed to update state to uploading: %w", err)
+	}
+	if hasLostLease() {
+		return ErrLeaseConflict
+	}
+
+	remotePath := BuildRemotePath(video.YoutubeID, outputPath)
+	storagePath, err := w.cfg.Uploader.Upload(jobCtx, outputPath, remotePath)
+	if err != nil {
+		if hasLostLease() {
+			return ErrLeaseConflict
+		}
+		return fmt.Errorf("upload failed: %w", err)
+	}
+	if hasLostLease() {
+		return ErrLeaseConflict
+	}
+
+	// Mark job as completed
+	if err := w.completeJob(jobCtx, video.ID, storagePath); err != nil {
 		return fmt.Errorf("failed to complete job: %w", err)
 	}
 
 	w.logger.Info("job completed",
 		"job_id", video.ID,
 		"youtube_id", video.YoutubeID,
-		"storage_path", outputPath,
+		"storage_path", storagePath,
 	)
+
 	return nil
 }
 
@@ -224,6 +320,10 @@ func (w *Worker) runYTDLP(ctx context.Context, youtubeID string, outputDir strin
 
 // heartbeatLoop periodically sends heartbeats and lease renewals.
 func (w *Worker) heartbeatLoop(ctx context.Context, jobID int64) {
+	w.heartbeatLoopWithLeaseLoss(ctx, jobID, nil)
+}
+
+func (w *Worker) heartbeatLoopWithLeaseLoss(ctx context.Context, jobID int64, onLeaseLost func()) {
 	ticker := time.NewTicker(w.cfg.HeartbeatFreq)
 	defer ticker.Stop()
 
@@ -239,6 +339,10 @@ func (w *Worker) heartbeatLoop(ctx context.Context, jobID int64) {
 			// Renew the lease
 			if err := w.renewLease(ctx, jobID); err != nil {
 				w.logger.Warn("lease renewal failed", "error", err)
+				if errors.Is(err, ErrLeaseConflict) && onLeaseLost != nil {
+					onLeaseLost()
+					return
+				}
 			}
 		}
 	}
@@ -311,7 +415,16 @@ func (w *Worker) postJSON(ctx context.Context, path string, body any) (*http.Res
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	return w.client.Do(req)
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		responseBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(responseBody)}
+	}
+	return resp, nil
 }
 
 // trimNewlines removes leading/trailing whitespace and newlines.

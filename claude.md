@@ -4,15 +4,15 @@
 
 ## Project Overview
 
-Scrape-Tupe is an elastic video-download pipeline backed by **Bunny Magic Containers**, orchestrated by a central **master** service with **SQLite** as the single source of truth.
+Scrape-Tupe is migrating to a Cloud Run Jobs and Cloud Storage video-download pipeline. The authoritative migration design is [`docs/gcp-migration-report.md`](docs/gcp-migration-report.md). SQLite remains only a local-development adapter until the Firestore control plane is implemented.
 
 ## Architecture
 
 Three logical components:
 
-- **Master** — HTTP API server, owns the SQLite database, manages workers and jobs, controls Bunny scaling.
+- **Master** — HTTP API server that will own Firestore state, manage workers/jobs, and start bounded Cloud Run Job executions.
 - **Normalizer** — Accepts channel/playlist/video URLs, expands them into individual video records via yt-dlp metadata extraction.
-- **Downloader** — Worker process that claims one job at a time, downloads with yt-dlp, uploads to Bunny Storage, reports completion.
+- **Downloader** — bounded Cloud Run Job task that claims jobs, downloads with yt-dlp, uploads to Cloud Storage, then exits when the queue drains.
 
 ## Project Structure
 
@@ -22,11 +22,11 @@ cmd/
   downloader/     — Downloader worker entry point
   normalizer/     — Normalizer entry point
 internal/
-  db/             — SQLite database layer (schema, sources, videos, workers)
+  db/             — SQLite local-development database layer (to be replaced by Firestore)
   master/         — Master HTTP handlers, server, scaler
-  downloader/     — Downloader worker logic (yt-dlp integration, heartbeats)
+  downloader/     — Downloader task logic (yt-dlp integration, leases, upload abstraction)
   normalizer/     — Normalizer logic (placeholder)
-  bunny/          — Bunny API clients (containers + storage, placeholders)
+  gcp/            — Google Cloud integrations (Cloud Storage today; Run/Firestore next)
 docs/
   plan.md         — Full build plan with phases and architecture
 ```
@@ -54,15 +54,15 @@ docs/
 
 - **Phase 1 ✅** — SQLite schema + Master HTTP API
 - **Phase 2 ✅** — Single local downloader with yt-dlp
-- **Phase 3 ⬜** — Bunny Storage upload integration
+- **Phase A (in progress)** — GCS upload integration, bounded downloader tasks, and container images
 - **Phase 4 ⬜** — Normalizer (channel/playlist/video expansion)
-- **Phases 5–10 ⬜** — Leases, Docker, Bunny deployment, autoscaling
+- **Next** — Firestore transactions/counters, Cloud Run Job execution guard/client, and Terraform deployment
 
 ## Key Design Decisions
 
 1. **Pull-based job distribution** — Workers pull jobs from master; master never pushes.
 2. **Lease-based fault tolerance** — Every claimed job has a renewable lease; expired leases are auto-recovered.
-3. **Master is the autoscaler** — Calculates required capacity from the video table, sets Bunny min=max=N.
+3. **Master launches bounded batches** — Calculates pending work and starts one guarded Cloud Run Job execution capped at `MAX_PARALLELISM`.
 4. **SIGTERM handling** — Downloader releases lease on graceful shutdown; lease expiry is the fallback.
 
 ## Build & Run

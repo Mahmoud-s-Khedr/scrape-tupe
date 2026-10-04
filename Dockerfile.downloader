@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1
+ARG YT_DLP_VERSION=2025.10.14
+
+FROM golang:1.26.8-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/downloader ./cmd/downloader
+
+FROM python:3.13-slim-bookworm
+ARG YT_DLP_VERSION
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ffmpeg \
+    && python -m pip install --no-cache-dir "yt-dlp==${YT_DLP_VERSION}" \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/downloader /downloader
+ENV OUTPUT_DIR=/tmp/scrape-tupe/downloads \
+    STORAGE_BACKEND=gcs \
+    EXIT_WHEN_EMPTY=true \
+    CLEANUP_TEMP=true
+USER 65532:65532
+ENTRYPOINT ["/downloader"]

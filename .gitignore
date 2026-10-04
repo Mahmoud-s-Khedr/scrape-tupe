@@ -1,7 +1,10 @@
 # Binaries
-master
-downloader
-normalizer
+/master
+/downloader
+/normalizer
+
+# Environment
+.env
 
 # Database
 *.db

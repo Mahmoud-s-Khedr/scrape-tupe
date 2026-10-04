@@ -3,8 +3,17 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 )
+
+// ErrLeaseNotOwned means the job was released, recovered, or assigned to a
+// different worker before a worker-owned state transition completed.
+var ErrLeaseNotOwned = errors.New("job lease is not owned by worker")
+
+// ErrInvalidVideoState indicates a worker requested a state that workers may
+// not set directly.
+var ErrInvalidVideoState = errors.New("invalid worker video state")
 
 type Video struct {
 	ID           int64      `json:"id"`
@@ -83,7 +92,7 @@ func (db *DB) ClaimJob(ctx context.Context, workerID string, leaseDuration time.
 		)
 		RETURNING id, youtube_id, source_id, title, state, worker_id, lease_until, attempt_count, storage_path, error, created_at, updated_at
 	`
-	leaseUntil := time.Now().Add(leaseDuration)
+	leaseUntil := sqliteTimestamp(time.Now().Add(leaseDuration))
 	var v Video
 	err := db.QueryRowContext(ctx, query, workerID, leaseUntil).Scan(
 		&v.ID, &v.YoutubeID, &v.SourceID, &v.Title, &v.State, &v.WorkerID, &v.LeaseUntil, &v.AttemptCount, &v.StoragePath, &v.Error, &v.CreatedAt, &v.UpdatedAt,
@@ -95,22 +104,81 @@ func (db *DB) ClaimJob(ctx context.Context, workerID string, leaseDuration time.
 }
 
 func (db *DB) RenewLease(ctx context.Context, videoID int64, workerID string, leaseDuration time.Duration) error {
-	leaseUntil := time.Now().Add(leaseDuration)
-	query := `UPDATE videos SET lease_until = ?, updated_at = datetime('now') WHERE id = ? AND worker_id = ?`
-	_, err := db.ExecContext(ctx, query, leaseUntil, videoID, workerID)
-	return err
+	leaseUntil := sqliteTimestamp(time.Now().Add(leaseDuration))
+	query := `
+		UPDATE videos SET lease_until = ?, updated_at = datetime('now')
+		WHERE id = ? AND worker_id = ?
+		  AND state IN ('leased', 'downloading', 'uploading')
+		  AND julianday(lease_until) > julianday('now')
+	`
+	result, err := db.ExecContext(ctx, query, leaseUntil, videoID, workerID)
+	if err != nil {
+		return err
+	}
+	return requireWorkerOwnedUpdate(result)
 }
 
 func (db *DB) UpdateVideoState(ctx context.Context, videoID int64, workerID string, state string, errMsg *string) error {
-	query := `UPDATE videos SET state = ?, error = ?, updated_at = datetime('now') WHERE id = ? AND worker_id = ?`
-	_, err := db.ExecContext(ctx, query, state, errMsg, videoID, workerID)
-	return err
+	var allowedFrom string
+	var anyActiveState bool
+	switch state {
+	case "downloading":
+		allowedFrom = "leased"
+	case "uploading":
+		allowedFrom = "downloading"
+	case "error":
+		// A failure can be recorded from any active worker-owned lease state.
+		anyActiveState = true
+	default:
+		return ErrInvalidVideoState
+	}
+	query := `
+		UPDATE videos SET state = ?, error = ?, updated_at = datetime('now')
+		WHERE id = ? AND worker_id = ? AND `
+	args := []any{state, errMsg, videoID, workerID}
+	if anyActiveState {
+		query += `state IN ('leased', 'downloading', 'uploading')`
+	} else {
+		query += `state = ?`
+		args = append(args, allowedFrom)
+	}
+	query += ` AND julianday(lease_until) > julianday('now')`
+	result, err := db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	return requireWorkerOwnedUpdate(result)
 }
 
 func (db *DB) CompleteVideo(ctx context.Context, videoID int64, workerID string, storagePath string) error {
-	query := `UPDATE videos SET state = 'completed', storage_path = ?, updated_at = datetime('now') WHERE id = ? AND worker_id = ?`
-	_, err := db.ExecContext(ctx, query, storagePath, videoID, workerID)
-	return err
+	query := `
+		UPDATE videos SET state = 'completed', storage_path = ?, updated_at = datetime('now')
+		WHERE id = ? AND worker_id = ? AND state = 'uploading'
+		  AND julianday(lease_until) > julianday('now')
+	`
+	result, err := db.ExecContext(ctx, query, storagePath, videoID, workerID)
+	if err != nil {
+		return err
+	}
+	return requireWorkerOwnedUpdate(result)
+}
+
+func requireWorkerOwnedUpdate(result sql.Result) error {
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrLeaseNotOwned
+	}
+	return nil
+}
+
+// sqliteTimestamp uses a format SQLite's date functions parse consistently.
+// Passing time.Time directly leaves formatting up to the driver, which can
+// yield a timestamp SQLite's julianday function does not recognize.
+func sqliteTimestamp(value time.Time) string {
+	return value.UTC().Format("2006-01-02 15:04:05.999999")
 }
 
 func (db *DB) RecoverExpiredLeases(ctx context.Context) (int, error) {
@@ -120,7 +188,8 @@ func (db *DB) RecoverExpiredLeases(ctx context.Context) (int, error) {
 			worker_id = NULL,
 			lease_until = NULL,
 			updated_at = datetime('now')
-		WHERE state IN ('leased', 'downloading', 'uploading') AND lease_until < datetime('now')
+		WHERE state IN ('leased', 'downloading', 'uploading')
+		  AND julianday(lease_until) < julianday('now')
 	`
 	res, err := db.ExecContext(ctx, query)
 	if err != nil {

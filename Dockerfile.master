@@ -1,0 +1,15 @@
+# syntax=docker/dockerfile:1
+FROM golang:1.26.8-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/master ./cmd/master
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/master /master
+ENV MASTER_ADDR=:8080 \
+    MASTER_DB=/tmp/scrape-tupe.db
+EXPOSE 8080
+USER nonroot:nonroot
+ENTRYPOINT ["/master"]

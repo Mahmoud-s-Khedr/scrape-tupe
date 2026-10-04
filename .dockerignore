@@ -1,0 +1,9 @@
+.git
+.env
+*.db
+*.db-shm
+*.db-wal
+master
+downloader
+normalizer
+tmp

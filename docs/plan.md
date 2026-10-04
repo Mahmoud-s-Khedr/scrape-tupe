@@ -1,285 +1,68 @@
-# Scrape-Tupe — Build Plan
+# Scrape-Tupe — GCP Migration Roadmap
 
-> Elastic video-download pipeline backed by **Bunny Magic Containers**, orchestrated by a central **master** service with **SQLite** as the single source of truth.
+Scrape-Tupe is moving to a bounded, pull-based GCP pipeline. The intended production shape is a Cloud Run **service** for the master, short-lived Cloud Run **Jobs** for downloaders, private GCS for artifacts, and Firestore for the control plane.
 
----
+> Historical note: the Bunny-based architecture is retired. Its clients, flags, and deployment assumptions are not part of this roadmap.
 
-## Architecture Overview
-
-```text
-             INPUT
-        channel / playlist / video
-                 │
-                 ▼
-        ┌─────────────────┐
-        │   Normalizer    │
-        │     yt-dlp      │
-        └────────┬────────┘
-                 │
-          discovered videos
-                 ▼
-        ┌─────────────────┐
-        │     MASTER      │
-        │                 │
-        │ SQLite          │
-        │ leases          │
-        │ worker registry │
-        │ scaler          │
-        │ Bunny API       │
-        └───────┬─────────┘
-                │
-        desired capacity N
-                │
-                ▼
-        Bunny Magic Containers
-        downloader application
-                │
-      ┌─────────┼─────────┐
-      ▼         ▼         ▼
-   Worker 1  Worker 2  Worker N
-      │         │         │
-      └──── claim jobs ───┘
-                │
-             yt-dlp
-                │
-                ▼
-          Bunny Storage
-                │
-                ▼
-        MASTER: completed
-```
-
----
-
-## Three Logical Components
-
-### 1. Master
-
-- Owns the **SQLite** database.
-- Exposes an internal **HTTP API** for workers and normalizers.
-- Tracks every source, video, and job.
-- Manages **worker heartbeats** and **leases**.
-- Controls Bunny Magic Containers through the **Bunny API** (deploy / undeploy / autoscaling `min`/`max` / inspect desired & active instances / recreate broken pods).
-
-### 2. Normalizer
-
-- Accepts channel, playlist, and direct-video URLs.
-- Uses **yt-dlp** metadata / flat extraction to resolve them into unique individual video records.
-- Inserts discovered videos into SQLite.
-- Initially runs as a **single instance**.
-
-### 3. Downloader
-
-- Takes **exactly one video job** at a time.
-- Downloads with **yt-dlp / ffmpeg**.
-- Uploads the finished artifact to **Bunny Storage**.
-- Reports completion, then immediately requests the next job.
-- Replicas are **elastic** — scaled by the master.
-
----
-
-## Data Model (SQLite)
-
-### Core Tables
-
-| Table     | Purpose                                                      |
-| --------- | ------------------------------------------------------------ |
-| `sources` | Channel / playlist / direct-video URLs submitted for processing |
-| `videos`  | Individual video records, deduplicated by **YouTube ID**     |
-| `workers` | Registered downloader pods with heartbeat tracking           |
-
-### Video State Machine
+## Target architecture
 
 ```text
-pending → leased → downloading → uploading → completed
-                                            ↘ error (retryable)
+source submission → normalizer → Firestore videos
+                                  │
+                         Cloud Run master service
+                         leases / execution guard
+                                  │
+                  bounded Cloud Run downloader Job tasks
+                                  │
+                              yt-dlp / ffmpeg
+                                  │
+                           private GCS artifacts
 ```
 
-### Key Video Columns
+The master owns the HTTP API, job state machine, renewable leases, and guarded execution decisions. Each downloader claims one job at a time, transitions it through `leased → downloading → uploading → completed`, and exits once the queue is empty. A valid lease is required for every worker-owned transition; expired work is recovered for another task.
 
-| Column          | Description                                          |
-| --------------- | ---------------------------------------------------- |
-| `youtube_id`    | **Unique key** — dedup by YouTube ID, not submitted URL |
-| `state`         | Current lifecycle state (see above)                  |
-| `worker_id`     | Pod currently holding the lease                      |
-| `lease_until`   | Timestamp when the lease expires                     |
-| `attempt_count` | Number of download attempts                          |
-| `storage_path`  | Final path in Bunny Storage                          |
-| `error`         | Last error message (if any)                          |
+Artifacts are immutable GCS objects at `videos/{youtube_id}/{filename}`. The uploader uses GCS create-only writes and CRC32C, and accepts an existing object only after its size and CRC32C match the local artifact.
 
----
+## Migration phases
 
-## Step-by-Step Plan
+| Phase | Deliverable | Status |
+| --- | --- | --- |
+| A | Local master/downloader foundation: SQLite adapter, leases, Docker images, noop/local/GCS upload configuration, bounded empty-queue exit | In progress and locally verified |
+| B | Storage abstraction and Firestore control plane | Next |
+| C | Normalizer and guarded Cloud Run Job execution control | Deferred |
+| D | Terraform, production IAM, and bounded end-to-end validation | Deferred |
 
-### Step 1 — Normalization as the Single Entry Point
+### Phase A — current foundation
 
-All input goes through normalization:
+- The local master remains SQLite-backed for development only.
+- Downloader HTTP operations reject every non-2xx response. A `409 Conflict` is a lease loss: the task does not upload, complete, or overwrite the job with an error.
+- Lease renewal, worker state transitions, and completion are enforced in the SQLite update predicates, including lease expiry and state ordering.
+- Docker images exist for the master and downloader. The downloader supports `noop`, `local`, and `gcs` storage backends; Cloud Run Job tasks use `EXIT_WHEN_EMPTY=true`.
 
-1. Submit the test dataset: **1 channel + 2 playlists + 5 direct videos**.
-2. The normalizer expands channels and playlists into individual video records.
-3. Videos are inserted with `INSERT ... ON CONFLICT DO NOTHING` (dedup on `youtube_id`).
-4. The source is marked `normalized`.
-5. Direct video URLs simply become one normalized video each.
-6. **Only after normalization** does a URL count toward downloader capacity.
+This is not a production Cloud Run deployment: SQLite is stored on an ephemeral filesystem and is unsuitable as a Cloud Run service control plane.
 
-### Step 2 — Pull-Based Job Distribution
+### Phase B — Firestore control plane
 
-Workers pull; the master **never pushes**.
+Define a storage interface under the master and retain SQLite only as its local adapter. Implement Firestore documents for sources, videos (keyed by YouTube ID), workers, and job executions. Claims, lease renewal, completion, and execution guards must be transactional; lease recovery must query expired leases explicitly rather than relying on TTL.
 
-1. Downloader starts and **registers** with the master using its Bunny pod ID.
-2. Calls `POST /jobs/claim` — master atomically leases **one** pending video.
-3. Worker **heartbeats** while yt-dlp is running.
-4. Uploads finished artifact to Bunny Storage.
-5. Calls `POST /jobs/{id}/complete`.
-6. Immediately claims the next job.
+### Phase C — normalizer and execution control
 
-### Step 3 — Lease-Based Fault Tolerance
+Build the normalizer to expand permitted channels, playlists, and direct video URLs into deduplicated video records. Then add guarded Cloud Run Job launching: the master sets `task_count` and `parallelism` to `min(pending_jobs, MAX_PARALLELISM)` only when no suitable execution is active. Tasks drain available work and stop; the master does not maintain an idle downloader fleet.
 
-Leases make worker death harmless:
+### Phase D — infrastructure and validation
 
-- Each claimed job gets a **60–120 second renewable lease**.
-- If a worker crashes, gets killed by Bunny, or loses network — heartbeats stop.
-- Master detects the **expired lease** and resets the video to `pending`.
-- A **different worker** retries the job.
+Provision Firestore Native mode, Artifact Registry, a private regional GCS bucket, service accounts, authenticated Cloud Run resources, and any required reconciliation scheduler with Terraform. CI supplies immutable image digests; Terraform never builds images and credentials never live in source, images, or `.env` files.
 
-> **IMPORTANT:** This is the key mechanism that prevents Bunny choosing the "wrong" pod during scale-down from corrupting the queue.
+Validate one authorized bounded batch from source submission through normalization, guarded task launch, GCS upload, and Firestore completion. Also force a task stop to verify lease recovery and verify tasks exit after drain.
 
-### Step 4 — Master as the Autoscaler
+## GCS IAM requirement
 
-The master calculates parallelism from the **video table** — not from channels/playlists:
-
-- If there are **N runnable video jobs** and capacity allows N, request **N downloader replicas**.
-- Bunny API allows updating autoscaling `min` and `max` (both required, values ≥ 1).
-- Master forces a target by setting `min=N, max=N`, subject to account/per-region limits.
-
-### Step 5 — V1 Scaling Strategy: Right-Size to Pending Work
-
-Bunny might terminate a busy pod instead of an idle one during scale-down. This is **safe** because:
-
-1. **SIGTERM handler** (Step 7) releases the lease before exit — the job is immediately re-available.
-2. **Lease expiry** (Step 3) catches hard crashes — the master resets the job to `pending` after 60–120 s.
-3. The worst case is **one video gets re-downloaded**, which is far cheaper than paying for idle pods.
-
-**Rules for V1:**
-
-| Condition                                            | Action                                                                       |
-| ---------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `pending_jobs > active_workers`                      | Scale **up** to `min(pending_jobs, max_capacity)`                            |
-| `pending_jobs < active_workers`                      | Scale **down** to `max(pending_jobs, 1)` — a killed busy pod's job is auto-requeued |
-| All videos in terminal state, nothing pending/running | **Undeploy** the entire downloader application                               |
-
-Bunny's API explicitly defines `undeploy` as stopping all running instances.
-
-### Step 6 — Batch Restart
-
-When normalization later discovers new videos while downloaders are undeployed:
+The downloader service account needs `storage.objects.create` for create-only uploads **and** `storage.objects.get` for idempotent duplicate verification: when a create precondition fails, the uploader calls `Attrs` to compare size and CRC32C. Bind both permissions with a bucket-level IAM condition limiting access to artifact names, for example:
 
 ```text
-videos pending > 0
-  → calculate required capacity
-  → deploy downloader app
-  → set min=max=N
-  → workers register
-  → workers claim jobs
+resource.name.startsWith(
+  "projects/_/buckets/BUCKET_NAME/objects/videos/"
+)
 ```
 
-Bunny has specifically improved Magic Containers lifecycle speed for automated / short-lived workloads.
-
-### Step 7 — Graceful Termination
-
-Every downloader handles `SIGTERM`:
-
-1. **Stop claiming** new jobs.
-2. **Release the current lease** back to the master (if possible).
-3. Exit cleanly.
-
-> **NOTE:** Lease expiry remains the fallback for hard crashes. This design means aggressive scale-down can be safely added later — correctness is already protected.
-
-### Step 8 — Temporary Download Directories
-
-Downloads use per-job temporary directories:
-
-```
-/tmp/jobs/<job-id>/
-```
-
-1. yt-dlp downloads there.
-2. ffmpeg merges there.
-3. Final file uploads to Bunny Storage.
-4. Directory is deleted.
-
-> **TIP:** Magic Containers are intended for worker/automation workloads, but the container runtime has finite local resources. Cleaning up promptly avoids disk pressure.
-
-### Step 9 — Master Reconciliation Loop
-
-Every few seconds the master runs:
-
-```text
-1. Recover expired leases
-2. Count remaining work
-3. Inspect registered workers
-4. Inspect Bunny application state (activeInstances vs desiredInstances)
-5. Scale up if useful
-6. Undeploy if absolutely no work remains
-```
-
-The Bunny overview API reports both `activeInstances` and `desiredInstances`, so the master does not have to assume that requesting 8 means 8 are already running.
-
----
-
-## Build Order
-
-| Phase       | Deliverable                                   | Key Milestone                                         | Status   |
-| ----------- | --------------------------------------------- | ----------------------------------------------------- | -------- |
-| **Phase 1** | SQLite schema + Master HTTP API               | Master starts, serves endpoints, reads/writes DB      | ✅ Done  |
-| **Phase 2** | Single local downloader with yt-dlp           | One video downloaded end-to-end locally                | ✅ Done  |
-| **Phase 3** | Bunny Storage upload integration              | Downloaded video lands in Bunny Storage                | ⬜       |
-| **Phase 4** | Normalizer (channel/playlist/video expansion) | Test dataset fully expanded into `videos` table        | ⬜       |
-| **Phase 5** | Leases & heartbeats                           | Simulated crash → lease expires → job re-queued        | ⬜       |
-| **Phase 6** | Dockerize the downloader                      | Container image runs and completes one job             | ⬜       |
-| **Phase 7** | Deploy one Bunny worker                       | Single Magic Container replica processes jobs          | ⬜       |
-| **Phase 8** | Test 2–3 replicas manually                    | Multiple workers drain the queue in parallel           | ⬜       |
-| **Phase 9** | Connect Bunny API to master                   | Master reads `activeInstances` / `desiredInstances`    | ⬜       |
-| **Phase 10**| Automatic scale-up / undeploy logic           | Full autoscaling loop operational                      | ⬜       |
-
----
-
-## First Milestone (End-to-End Demo)
-
-> Submit **1 channel + 2 playlists + 5 direct videos**. Watch:
->
-> 1. Normalization populate SQLite with all discovered videos.
-> 2. Master automatically deploy the appropriate number of Bunny downloader replicas.
-> 3. Workers drain the entire queue.
-> 4. All artifacts uploaded to Bunny Storage.
-> 5. Master undeploy the downloader application.
->
-> **This single demo proves essentially the whole architecture.**
-
-## Progress Log
-
-### Phase 1 — SQLite schema + Master HTTP API ✅
-
-- Created SQLite schema (`internal/db/schema.sql`) with `sources`, `videos`, and `workers` tables.
-- Built database layer (`internal/db/`) with full CRUD, job claiming, lease management, and state tracking.
-- Implemented Master HTTP API (`internal/master/`) with all endpoints:
-  - Sources: `POST /sources`, `GET /sources`, `GET /sources/{id}`
-  - Videos: `GET /videos`, `GET /videos/{id}`
-  - Workers: `POST /workers/register`, `POST /workers/heartbeat`, `GET /workers`
-  - Jobs: `POST /jobs/claim`, `POST /jobs/{id}/state`, `POST /jobs/{id}/complete`, `POST /jobs/{id}/renew`
-  - Stats/Health: `GET /stats`, `GET /health`
-
-### Phase 2 — Single local downloader with yt-dlp ✅
-
-- Implemented downloader worker (`internal/downloader/downloader.go`):
-  - Registers with master, claims jobs in a loop, runs yt-dlp, sends heartbeats + lease renewals.
-  - Handles SIGTERM/SIGINT for graceful shutdown.
-- Built CLI entry point (`cmd/downloader/main.go`) with flags for master URL, worker ID, output dir.
-- **Tested end-to-end** with video `3YSxCEGddVU` — downloaded successfully to `/tmp/scrape-tupe/downloads/job-1/3YSxCEGddVU.mkv` (6.3 MB).
-
----
-
-## References
-
-- [How we sped up deploys and updates in Magic Containers](https://bunny.net/blog/how-we-sped-up-deploys-updates-and-undeploys-in-magic-containers/) — Bunny lifecycle improvements
-- [Magic Containers](https://bunny.net/magic-containers/) — Product overview and runtime constraints
+Use a separate conditional binding (or custom role) if needed to grant exactly those two permissions; `storage.objects.create` alone is insufficient.

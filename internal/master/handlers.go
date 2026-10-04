@@ -1,7 +1,9 @@
 package master
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -23,6 +25,18 @@ func sendJSON(w http.ResponseWriter, status int, data any) {
 
 func sendError(w http.ResponseWriter, status int, msg string) {
 	sendJSON(w, status, ErrorResponse{Error: msg})
+}
+
+func sendWorkerUpdateError(w http.ResponseWriter, err error) {
+	if errors.Is(err, db.ErrInvalidVideoState) {
+		sendError(w, http.StatusBadRequest, "invalid job state")
+		return
+	}
+	if errors.Is(err, db.ErrLeaseNotOwned) {
+		sendError(w, http.StatusConflict, "job lease is no longer owned by this worker")
+		return
+	}
+	sendError(w, http.StatusInternalServerError, "failed to update job")
 }
 
 type CreateSourceReq struct {
@@ -167,9 +181,23 @@ func (s *Server) handleClaimJob(w http.ResponseWriter, r *http.Request) {
 	if dur == 0 {
 		dur = 5 * time.Minute
 	}
+	// A claim is also an opportunity to recover work if the periodic recovery
+	// loop has not run yet (for example, immediately after a master restart).
+	// Failure is surfaced instead of treating a database outage as an empty
+	// queue.
+	if _, err := s.db.RecoverExpiredLeases(r.Context()); err != nil {
+		s.logger.Error("failed to recover expired job leases before claim", "error", err)
+		sendError(w, http.StatusInternalServerError, "failed to recover expired job leases")
+		return
+	}
 	video, err := s.db.ClaimJob(r.Context(), req.WorkerID, dur)
 	if err != nil {
-		sendError(w, http.StatusNotFound, "no pending jobs")
+		if errors.Is(err, sql.ErrNoRows) {
+			sendError(w, http.StatusNotFound, "no pending jobs")
+			return
+		}
+		s.logger.Error("failed to claim job", "error", err)
+		sendError(w, http.StatusInternalServerError, "failed to claim job")
 		return
 	}
 	sendJSON(w, http.StatusOK, video)
@@ -195,7 +223,7 @@ func (s *Server) handleUpdateJobState(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.db.UpdateVideoState(r.Context(), id, req.WorkerID, req.State, req.Error); err != nil {
 		s.logger.Error("failed to update job state", "error", err)
-		sendError(w, http.StatusInternalServerError, "failed to update job state")
+		sendWorkerUpdateError(w, err)
 		return
 	}
 	sendJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -220,7 +248,7 @@ func (s *Server) handleCompleteJob(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.db.CompleteVideo(r.Context(), id, req.WorkerID, req.StoragePath); err != nil {
 		s.logger.Error("failed to complete job", "error", err)
-		sendError(w, http.StatusInternalServerError, "failed to complete job")
+		sendWorkerUpdateError(w, err)
 		return
 	}
 	sendJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -249,7 +277,7 @@ func (s *Server) handleRenewJob(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.db.RenewLease(r.Context(), id, req.WorkerID, dur); err != nil {
 		s.logger.Error("failed to renew job", "error", err)
-		sendError(w, http.StatusInternalServerError, "failed to renew job")
+		sendWorkerUpdateError(w, err)
 		return
 	}
 	sendJSON(w, http.StatusOK, map[string]string{"status": "ok"})
