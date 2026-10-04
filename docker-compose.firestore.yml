@@ -1,0 +1,8 @@
+services:
+  firestore:
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators
+    command: >
+      gcloud beta emulators firestore start --host-port=0.0.0.0:8080
+      --database-mode=firestore-native --project=scrape-tupe-test
+    ports:
+      - "8080:8080"

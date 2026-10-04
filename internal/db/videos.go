@@ -31,15 +31,26 @@ type Video struct {
 }
 
 func (db *DB) InsertVideo(ctx context.Context, youtubeID string, sourceID int64, title string) (int64, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
 	query := `INSERT INTO videos (youtube_id, source_id, title) VALUES (?, ?, ?) ON CONFLICT(youtube_id) DO NOTHING RETURNING id`
 	var id int64
-	err := db.QueryRowContext(ctx, query, youtubeID, sourceID, title).Scan(&id)
+	err = tx.QueryRowContext(ctx, query, youtubeID, sourceID, title).Scan(&id)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			err = db.QueryRowContext(ctx, `SELECT id FROM videos WHERE youtube_id = ?`, youtubeID).Scan(&id)
+			err = tx.QueryRowContext(ctx, `SELECT id FROM videos WHERE youtube_id = ?`, youtubeID).Scan(&id)
 		}
 	}
-	return id, err
+	if err != nil {
+		return 0, err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO video_sources(video_id, source_id) VALUES (?, ?)`, id, sourceID); err != nil {
+		return 0, err
+	}
+	return id, tx.Commit()
 }
 
 func (db *DB) GetVideo(ctx context.Context, id int64) (*Video, error) {
@@ -152,7 +163,7 @@ func (db *DB) UpdateVideoState(ctx context.Context, videoID int64, workerID stri
 
 func (db *DB) CompleteVideo(ctx context.Context, videoID int64, workerID string, storagePath string) error {
 	query := `
-		UPDATE videos SET state = 'completed', storage_path = ?, updated_at = datetime('now')
+		UPDATE videos SET state = 'completed', storage_path = ?, worker_id = NULL, lease_until = NULL, updated_at = datetime('now')
 		WHERE id = ? AND worker_id = ? AND state = 'uploading'
 		  AND julianday(lease_until) > julianday('now')
 	`

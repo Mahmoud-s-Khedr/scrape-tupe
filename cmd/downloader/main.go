@@ -21,6 +21,7 @@ func main() {
 	}
 
 	masterURL := flag.String("master", envOr("MASTER_URL", "http://localhost:8080"), "Master server URL")
+	masterAudience := flag.String("master-audience", envOr("MASTER_AUDIENCE", ""), "Cloud Run ID-token audience; empty for local master")
 	workerID := flag.String("id", envOr("WORKER_ID", ""), "Worker ID (defaults to hostname)")
 	outputDir := flag.String("output", envOr("OUTPUT_DIR", "/tmp/scrape-tupe/downloads"), "Download output directory")
 	storageBackend := flag.String("storage-backend", envOr("STORAGE_BACKEND", "noop"), "Storage backend: noop, local, or gcs")
@@ -65,12 +66,13 @@ func main() {
 	}
 
 	cfg := downloader.Config{
-		MasterURL:      *masterURL,
-		WorkerID:       wid,
-		OutputDir:      *outputDir,
-		Uploader:       uploader,
-		CleanupTempDir: *cleanupTemp,
-		ExitWhenEmpty:  *exitWhenEmpty,
+		MasterURL:       *masterURL,
+		WorkerID:        wid,
+		OutputDir:       *outputDir,
+		Uploader:        uploader,
+		CleanupTempDir:  *cleanupTemp,
+		ExitWhenEmpty:   *exitWhenEmpty,
+		IDTokenAudience: *masterAudience,
 	}
 
 	w := downloader.New(cfg, logger)

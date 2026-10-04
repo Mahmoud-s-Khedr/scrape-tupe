@@ -33,3 +33,6 @@ Thumbs.db
 
 # Temp downloads
 /tmp/
+
+# Terraform local working data (providers, modules, state cache)
+**/.terraform/

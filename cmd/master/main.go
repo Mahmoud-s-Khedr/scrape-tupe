@@ -7,11 +7,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/Mahmoud-s-Khedr/scrape-tupe/internal/db"
 	"github.com/Mahmoud-s-Khedr/scrape-tupe/internal/envfile"
+	controlfs "github.com/Mahmoud-s-Khedr/scrape-tupe/internal/firestore"
+	"github.com/Mahmoud-s-Khedr/scrape-tupe/internal/gcp"
 	"github.com/Mahmoud-s-Khedr/scrape-tupe/internal/master"
 )
 
@@ -23,19 +26,52 @@ func main() {
 	}
 
 	addr := flag.String("addr", envOr("MASTER_ADDR", ":8080"), "HTTP server address")
-	dbPath := flag.String("db", envOr("MASTER_DB", "scrape-tupe.db"), "Database file path")
+	dbPath := flag.String("db", envOr("MASTER_DB", "scrape-tupe.db"), "SQLite database file path (local only)")
+	storeKind := flag.String("store", envOr("MASTER_STORE", "sqlite"), "Control store: sqlite (local) or firestore")
+	projectID := flag.String("gcp-project", envOr("GOOGLE_CLOUD_PROJECT", ""), "GCP project for Firestore")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
-	database, err := db.Open(*dbPath)
-	if err != nil {
-		logger.Error("failed to open database", "error", err)
+	var backend any
+	var closer interface{ Close() error }
+	switch *storeKind {
+	case "sqlite":
+		database, err := db.Open(*dbPath)
+		if err != nil {
+			logger.Error("failed to open local database", "error", err)
+			os.Exit(1)
+		}
+		backend, closer = database, database
+	case "firestore":
+		store, err := controlfs.New(context.Background(), *projectID)
+		if err != nil {
+			logger.Error("failed to open Firestore", "error", err)
+			os.Exit(1)
+		}
+		backend, closer = store, store
+	default:
+		logger.Error("unknown control store", "store", *storeKind)
 		os.Exit(1)
 	}
-	defer database.Close()
+	defer closer.Close()
 
-	srv := master.New(database, logger)
+	srv := master.New(backend, logger)
+	srv.SetAuth(envOr("OPERATOR_API_KEY", ""), envOr("MASTER_AUDIENCE", ""))
+	srv.SetWorkerServiceAccounts(strings.Split(envOr("WORKER_SERVICE_ACCOUNTS", ""), ",")...)
+	if err := srv.ValidateAuthConfig(); err != nil {
+		logger.Error("invalid worker authentication configuration", "error", err)
+		os.Exit(1)
+	}
+	if *storeKind == "firestore" {
+		jobs, err := gcp.NewCloudRunJobs(context.Background(), *projectID, envOr("GCP_REGION", "us-central1"), envOr("DISCOVERY_JOB", "scrape-tupe-discovery"), envOr("NORMALIZER_JOB", "scrape-tupe-normalizer"), envOr("DOWNLOADER_JOB", "scrape-tupe-downloader"), 45*time.Minute)
+		if err != nil {
+			logger.Error("failed to configure Cloud Run Jobs client", "error", err)
+			os.Exit(1)
+		}
+		defer jobs.Close()
+		srv.SetJobRunner(jobs)
+	}
 	leaseRecoveryCtx, cancelLeaseRecovery := context.WithCancel(context.Background())
 	defer cancelLeaseRecovery()
 	go srv.RunLeaseRecovery(leaseRecoveryCtx, time.Minute)

@@ -12,8 +12,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"google.golang.org/api/idtoken"
 )
 
 // ErrNoPendingJobs is returned when the master has no job to lease.
@@ -45,29 +49,66 @@ func (e *HTTPStatusError) Is(target error) bool {
 
 // Video mirrors the master's video response.
 type Video struct {
-	ID        int64   `json:"id"`
-	YoutubeID string  `json:"youtube_id"`
-	Title     *string `json:"title,omitempty"`
-	State     string  `json:"state"`
+	ID           int64   `json:"id"` // Legacy local SQLite id; Firestore uses YoutubeID as the route key.
+	YoutubeID    string  `json:"youtube_id"`
+	Title        *string `json:"title,omitempty"`
+	State        string  `json:"state"`
+	ReservedSize int64   `json:"reserved_size_bytes,omitempty"`
+}
+
+// UnmarshalJSON accepts legacy numeric IDs and Firestore's string YouTube-ID
+// document IDs. Worker requests always prefer a YouTube ID when no numeric ID
+// is present.
+func (v *Video) UnmarshalJSON(data []byte) error {
+	type wire struct {
+		ID           json.RawMessage `json:"id"`
+		YoutubeID    string          `json:"youtube_id"`
+		Title        *string         `json:"title"`
+		State        string          `json:"state"`
+		ReservedSize int64           `json:"reserved_size_bytes"`
+	}
+	var x wire
+	if err := json.Unmarshal(data, &x); err != nil {
+		return err
+	}
+	v.YoutubeID = x.YoutubeID
+	v.Title = x.Title
+	v.State = x.State
+	v.ReservedSize = x.ReservedSize
+	if len(x.ID) > 0 {
+		var n int64
+		if json.Unmarshal(x.ID, &n) == nil {
+			v.ID = n
+		} else {
+			var id string
+			_ = json.Unmarshal(x.ID, &id)
+			if v.YoutubeID == "" {
+				v.YoutubeID = id
+			}
+		}
+	}
+	return nil
 }
 
 // Config holds the downloader configuration.
 type Config struct {
-	MasterURL      string        // Base URL of the master server (e.g. http://localhost:8080)
-	WorkerID       string        // Unique identifier for this worker
-	LeaseDuration  time.Duration // How long the lease lasts (default 5m)
-	HeartbeatFreq  time.Duration // How often to send heartbeats (default 30s)
-	OutputDir      string        // Base directory for downloaded files
-	Uploader       Uploader      // Upload strategy (GCS, local filesystem, or noop)
-	CleanupTempDir bool          // Whether to delete temp dir after successful upload
-	ExitWhenEmpty  bool          // Exit successfully instead of polling when the queue is empty
+	MasterURL       string        // Base URL of the master server (e.g. http://localhost:8080)
+	WorkerID        string        // Unique identifier for this worker
+	LeaseDuration   time.Duration // How long the lease lasts (default 5m)
+	HeartbeatFreq   time.Duration // How often to send heartbeats (default 30s)
+	OutputDir       string        // Base directory for downloaded files
+	Uploader        Uploader      // Upload strategy (GCS, local filesystem, or noop)
+	CleanupTempDir  bool          // Whether to delete temp dir after successful upload
+	ExitWhenEmpty   bool          // Exit successfully instead of polling when the queue is empty
+	IDTokenAudience string        // Cloud Run master URL; empty keeps local HTTP unauthenticated
 }
 
 // Worker is a single-video downloader that pulls jobs from the master.
 type Worker struct {
-	cfg    Config
-	client *http.Client
-	logger *slog.Logger
+	cfg     Config
+	client  *http.Client
+	logger  *slog.Logger
+	initErr error
 }
 
 // New creates a new downloader worker.
@@ -87,15 +128,29 @@ func New(cfg Config, logger *slog.Logger) *Worker {
 	if cfg.Uploader == nil {
 		cfg.Uploader = NewNoopUploader(logger)
 	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	var initErr error
+	if cfg.IDTokenAudience != "" {
+		idClient, err := idtoken.NewClient(context.Background(), cfg.IDTokenAudience)
+		if err == nil {
+			client = idClient
+		} else {
+			initErr = fmt.Errorf("configure Cloud Run ID token client: %w", err)
+		}
+	}
 	return &Worker{
-		cfg:    cfg,
-		client: &http.Client{Timeout: 30 * time.Second},
-		logger: logger,
+		cfg:     cfg,
+		client:  client,
+		logger:  logger,
+		initErr: initErr,
 	}
 }
 
 // Run starts the worker loop. It blocks until ctx is cancelled.
 func (w *Worker) Run(ctx context.Context) error {
+	if w.initErr != nil {
+		return w.initErr
+	}
 	w.logger.Info("worker starting", "worker_id", w.cfg.WorkerID, "master", w.cfg.MasterURL)
 
 	if err := w.register(ctx); err != nil {
@@ -127,7 +182,7 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 
 		w.logger.Info("claimed job",
-			"job_id", video.ID,
+			"job_id", video.jobKey(),
 			"youtube_id", video.YoutubeID,
 			"title", video.Title,
 		)
@@ -135,18 +190,18 @@ func (w *Worker) Run(ctx context.Context) error {
 		if err := w.processJob(ctx, video); err != nil {
 			if errors.Is(err, ErrLeaseConflict) {
 				w.logger.Warn("job lease lost; leaving it for recovery or its new owner",
-					"job_id", video.ID,
+					"job_id", video.jobKey(),
 					"youtube_id", video.YoutubeID,
 				)
 				continue
 			}
 			w.logger.Error("job failed",
-				"job_id", video.ID,
+				"job_id", video.jobKey(),
 				"youtube_id", video.YoutubeID,
 				"error", err,
 			)
 			errMsg := err.Error()
-			_ = w.updateJobState(ctx, video.ID, "error", &errMsg)
+			_ = w.updateJobState(ctx, video.jobKey(), "error", &errMsg)
 		}
 	}
 }
@@ -184,12 +239,13 @@ func (w *Worker) claimJob(ctx context.Context) (*Video, error) {
 // processJob downloads a single video using yt-dlp and uploads it.
 func (w *Worker) processJob(ctx context.Context, video *Video) error {
 	// Update state to downloading
-	if err := w.updateJobState(ctx, video.ID, "downloading", nil); err != nil {
+	jobID := video.jobKey()
+	if err := w.updateJobState(ctx, jobID, "downloading", nil); err != nil {
 		return fmt.Errorf("failed to update state to downloading: %w", err)
 	}
 
 	// Create per-job temp directory
-	jobDir := filepath.Join(w.cfg.OutputDir, fmt.Sprintf("job-%d", video.ID))
+	jobDir := filepath.Join(w.cfg.OutputDir, "job-"+safeName(jobID))
 	if err := os.MkdirAll(jobDir, 0o755); err != nil {
 		return fmt.Errorf("failed to create job dir: %w", err)
 	}
@@ -206,7 +262,7 @@ func (w *Worker) processJob(ctx context.Context, video *Video) error {
 	defer jobCancel()
 	leaseLost := make(chan struct{})
 	var markLeaseLost sync.Once
-	go w.heartbeatLoopWithLeaseLoss(jobCtx, video.ID, func() {
+	go w.heartbeatLoopWithLeaseLoss(jobCtx, jobID, func() {
 		markLeaseLost.Do(func() {
 			close(leaseLost)
 			jobCancel()
@@ -222,10 +278,14 @@ func (w *Worker) processJob(ctx context.Context, video *Video) error {
 	}
 
 	// Run yt-dlp
-	outputPath, err := w.runYTDLP(jobCtx, video.YoutubeID, jobDir)
+	outputPath, err := w.runYTDLP(jobCtx, video.YoutubeID, jobDir, video.ReservedSize)
 	if err != nil {
 		if hasLostLease() {
 			return ErrLeaseConflict
+		}
+		if class := classifyYTDLPFailure(err); class != "" {
+			_ = w.quarantineJob(ctx, jobID, class)
+			return nil
 		}
 		return fmt.Errorf("yt-dlp failed: %w", err)
 	}
@@ -234,13 +294,20 @@ func (w *Worker) processJob(ctx context.Context, video *Video) error {
 	}
 
 	w.logger.Info("download complete",
-		"job_id", video.ID,
+		"job_id", jobID,
 		"youtube_id", video.YoutubeID,
 		"output_path", outputPath,
 	)
 
 	// Upload to storage
-	if err := w.updateJobState(jobCtx, video.ID, "uploading", nil); err != nil {
+	info, err := os.Stat(outputPath)
+	if err != nil {
+		return fmt.Errorf("stat downloaded file: %w", err)
+	}
+	if video.ReservedSize > 0 && info.Size() > video.ReservedSize {
+		return fmt.Errorf("downloaded file exceeds reservation")
+	}
+	if err := w.updateJobState(jobCtx, jobID, "uploading", nil); err != nil {
 		return fmt.Errorf("failed to update state to uploading: %w", err)
 	}
 	if hasLostLease() {
@@ -260,12 +327,12 @@ func (w *Worker) processJob(ctx context.Context, video *Video) error {
 	}
 
 	// Mark job as completed
-	if err := w.completeJob(jobCtx, video.ID, storagePath); err != nil {
+	if err := w.completeJob(jobCtx, jobID, storagePath, info.Size()); err != nil {
 		return fmt.Errorf("failed to complete job: %w", err)
 	}
 
 	w.logger.Info("job completed",
-		"job_id", video.ID,
+		"job_id", jobID,
 		"youtube_id", video.YoutubeID,
 		"storage_path", storagePath,
 	)
@@ -274,18 +341,22 @@ func (w *Worker) processJob(ctx context.Context, video *Video) error {
 }
 
 // runYTDLP executes yt-dlp to download a video. Returns the output file path.
-func (w *Worker) runYTDLP(ctx context.Context, youtubeID string, outputDir string) (string, error) {
+func (w *Worker) runYTDLP(ctx context.Context, youtubeID string, outputDir string, maximumSize int64) (string, error) {
 	url := fmt.Sprintf("https://www.youtube.com/watch?v=%s", youtubeID)
 
 	// Output template: put the file in outputDir with youtube_id as name
 	outputTemplate := filepath.Join(outputDir, "%(id)s.%(ext)s")
 
 	args := []string{
+		"--js-runtimes", "deno",
 		"--no-playlist",
 		"--restrict-filenames",
 		"--print", "after_move:filepath",
 		"-o", outputTemplate,
 		url,
+	}
+	if maximumSize > 0 {
+		args = append([]string{"--max-filesize", strconv.FormatInt(maximumSize, 10)}, args...)
 	}
 
 	w.logger.Info("running yt-dlp", "youtube_id", youtubeID, "args", args)
@@ -319,11 +390,11 @@ func (w *Worker) runYTDLP(ctx context.Context, youtubeID string, outputDir strin
 }
 
 // heartbeatLoop periodically sends heartbeats and lease renewals.
-func (w *Worker) heartbeatLoop(ctx context.Context, jobID int64) {
+func (w *Worker) heartbeatLoop(ctx context.Context, jobID any) {
 	w.heartbeatLoopWithLeaseLoss(ctx, jobID, nil)
 }
 
-func (w *Worker) heartbeatLoopWithLeaseLoss(ctx context.Context, jobID int64, onLeaseLost func()) {
+func (w *Worker) heartbeatLoopWithLeaseLoss(ctx context.Context, jobID any, onLeaseLost func()) {
 	ticker := time.NewTicker(w.cfg.HeartbeatFreq)
 	defer ticker.Stop()
 
@@ -360,12 +431,12 @@ func (w *Worker) sendHeartbeat(ctx context.Context) error {
 }
 
 // renewLease extends the lease on the current job.
-func (w *Worker) renewLease(ctx context.Context, jobID int64) error {
+func (w *Worker) renewLease(ctx context.Context, jobID any) error {
 	body := map[string]any{
 		"worker_id":          w.cfg.WorkerID,
 		"lease_duration_sec": int(w.cfg.LeaseDuration.Seconds()),
 	}
-	resp, err := w.postJSON(ctx, fmt.Sprintf("/jobs/%d/renew", jobID), body)
+	resp, err := w.postJSON(ctx, "/jobs/"+jobIDString(jobID)+"/renew", body)
 	if err != nil {
 		return err
 	}
@@ -374,7 +445,7 @@ func (w *Worker) renewLease(ctx context.Context, jobID int64) error {
 }
 
 // updateJobState sets the job state on the master.
-func (w *Worker) updateJobState(ctx context.Context, jobID int64, state string, errMsg *string) error {
+func (w *Worker) updateJobState(ctx context.Context, jobID any, state string, errMsg *string) error {
 	body := map[string]any{
 		"worker_id": w.cfg.WorkerID,
 		"state":     state,
@@ -382,7 +453,7 @@ func (w *Worker) updateJobState(ctx context.Context, jobID int64, state string, 
 	if errMsg != nil {
 		body["error"] = *errMsg
 	}
-	resp, err := w.postJSON(ctx, fmt.Sprintf("/jobs/%d/state", jobID), body)
+	resp, err := w.postJSON(ctx, "/jobs/"+jobIDString(jobID)+"/state", body)
 	if err != nil {
 		return err
 	}
@@ -391,17 +462,65 @@ func (w *Worker) updateJobState(ctx context.Context, jobID int64, state string, 
 }
 
 // completeJob marks a job as completed with a storage path.
-func (w *Worker) completeJob(ctx context.Context, jobID int64, storagePath string) error {
-	body := map[string]string{
+func (w *Worker) completeJob(ctx context.Context, jobID any, storagePath string, actual ...int64) error {
+	body := map[string]any{
 		"worker_id":    w.cfg.WorkerID,
 		"storage_path": storagePath,
 	}
-	resp, err := w.postJSON(ctx, fmt.Sprintf("/jobs/%d/complete", jobID), body)
+	if len(actual) > 0 {
+		body["actual_size_bytes"] = actual[0]
+	}
+	resp, err := w.postJSON(ctx, "/jobs/"+jobIDString(jobID)+"/complete", body)
 	if err != nil {
 		return err
 	}
 	resp.Body.Close()
 	return nil
+}
+
+func (v *Video) jobKey() string {
+	if v.ID != 0 {
+		return strconv.FormatInt(v.ID, 10)
+	}
+	return v.YoutubeID
+}
+func jobIDString(id any) string {
+	switch v := id.(type) {
+	case string:
+		return v
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case int:
+		return strconv.Itoa(v)
+	default:
+		return fmt.Sprint(v)
+	}
+}
+func safeName(s string) string {
+	return strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, s)
+}
+func (w *Worker) quarantineJob(ctx context.Context, jobID, class string) error {
+	resp, e := w.postJSON(ctx, "/jobs/"+jobID+"/quarantine", map[string]any{"worker_id": w.cfg.WorkerID, "class": class, "cooldown_seconds": 3600})
+	if e != nil {
+		return e
+	}
+	resp.Body.Close()
+	return nil
+}
+func classifyYTDLPFailure(err error) string {
+	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "http error 429") || strings.Contains(s, "too many requests") || strings.Contains(s, "rate limit") {
+		return "rate_limited"
+	}
+	if strings.Contains(s, "sign in to confirm") || strings.Contains(s, "not available in your country") || strings.Contains(s, "access denied") || strings.Contains(s, "blocked") {
+		return "blocked"
+	}
+	return ""
 }
 
 // postJSON is a helper that POSTs JSON to a master endpoint.
