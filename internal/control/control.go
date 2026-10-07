@@ -10,6 +10,7 @@ import (
 )
 
 const ArtifactBudgetBytes int64 = 5 << 30
+const UnknownSizeReservationBytes int64 = 512 << 20
 
 var (
 	ErrNotFound        = errors.New("control-plane document not found")
@@ -27,6 +28,7 @@ type Source struct {
 	AuthorizationAcknowledged bool       `json:"authorization_acknowledged" firestore:"authorization_acknowledged"`
 	State                     string     `json:"state" firestore:"state"`
 	VideoCount                int        `json:"video_count" firestore:"video_count"`
+	DiscoveryComplete         bool       `json:"discovery_complete" firestore:"discovery_complete"`
 	DiscoveryCursor           int        `json:"discovery_cursor" firestore:"discovery_cursor"`
 	DiscoveredCount           int        `json:"discovered_count" firestore:"discovered_count"`
 	NormalizedCount           int        `json:"normalized_count" firestore:"normalized_count"`
@@ -76,6 +78,8 @@ type Video struct {
 	LeaseUntil       *time.Time `json:"lease_until,omitempty" firestore:"lease_until,omitempty"`
 	AttemptCount     int        `json:"attempt_count" firestore:"attempt_count"`
 	StoragePath      string     `json:"storage_path,omitempty" firestore:"storage_path,omitempty"`
+	ArtifactState    string     `json:"artifact_state,omitempty" firestore:"artifact_state,omitempty"`
+	ObjectGeneration int64      `json:"object_generation,omitempty" firestore:"object_generation,omitempty"`
 	Error            string     `json:"error,omitempty" firestore:"error,omitempty"`
 	ErrorClass       string     `json:"error_class,omitempty" firestore:"error_class,omitempty"`
 	QuarantinedUntil *time.Time `json:"quarantined_until,omitempty" firestore:"quarantined_until,omitempty"`
@@ -112,6 +116,8 @@ type Store interface {
 	ClaimDiscovery(context.Context, string, time.Duration) (*Source, error)
 	CheckpointDiscovery(context.Context, string, string, int, string) error
 	FinishDiscovery(context.Context, string, string) error
+	RenewDiscovery(context.Context, string, string, time.Duration) error
+	RenewRawURL(context.Context, string, string, time.Duration) error
 	FailDiscovery(context.Context, string, string, bool, string, string, time.Time) error
 
 	ClaimRawURL(context.Context, string, time.Duration) (*RawURL, error)

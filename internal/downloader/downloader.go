@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mahmoud-s-Khedr/scrape-tupe/internal/ytdlp"
 	"google.golang.org/api/idtoken"
 )
 
@@ -49,11 +50,12 @@ func (e *HTTPStatusError) Is(target error) bool {
 
 // Video mirrors the master's video response.
 type Video struct {
-	ID           int64   `json:"id"` // Legacy local SQLite id; Firestore uses YoutubeID as the route key.
-	YoutubeID    string  `json:"youtube_id"`
-	Title        *string `json:"title,omitempty"`
-	State        string  `json:"state"`
-	ReservedSize int64   `json:"reserved_size_bytes,omitempty"`
+	ID           int64      `json:"id"` // Legacy local SQLite id; Firestore uses YoutubeID as the route key.
+	YoutubeID    string     `json:"youtube_id"`
+	Title        *string    `json:"title,omitempty"`
+	State        string     `json:"state"`
+	ReservedSize int64      `json:"reserved_size_bytes,omitempty"`
+	LeaseUntil   *time.Time `json:"lease_until,omitempty"`
 }
 
 // UnmarshalJSON accepts legacy numeric IDs and Firestore's string YouTube-ID
@@ -66,11 +68,14 @@ func (v *Video) UnmarshalJSON(data []byte) error {
 		Title        *string         `json:"title"`
 		State        string          `json:"state"`
 		ReservedSize int64           `json:"reserved_size_bytes"`
+		LeaseUntil   *time.Time      `json:"lease_until"`
 	}
 	var x wire
 	if err := json.Unmarshal(data, &x); err != nil {
 		return err
 	}
+	v.ID = 0
+	v.LeaseUntil = x.LeaseUntil
 	v.YoutubeID = x.YoutubeID
 	v.Title = x.Title
 	v.State = x.State
@@ -134,6 +139,7 @@ func New(cfg Config, logger *slog.Logger) *Worker {
 		idClient, err := idtoken.NewClient(context.Background(), cfg.IDTokenAudience)
 		if err == nil {
 			client = idClient
+			client.Timeout = 30 * time.Second
 		} else {
 			initErr = fmt.Errorf("configure Cloud Run ID token client: %w", err)
 		}
@@ -168,7 +174,9 @@ func (w *Worker) Run(ctx context.Context) error {
 
 		video, err := w.claimJob(ctx)
 		if err != nil {
-			if errors.Is(err, ErrNoPendingJobs) && w.cfg.ExitWhenEmpty {
+			var statusErr *HTTPStatusError
+			capacity := errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusConflict
+			if (errors.Is(err, ErrNoPendingJobs) || capacity) && w.cfg.ExitWhenEmpty {
 				w.logger.Info("no pending jobs; bounded worker exiting")
 				return nil
 			}
@@ -262,12 +270,19 @@ func (w *Worker) processJob(ctx context.Context, video *Video) error {
 	defer jobCancel()
 	leaseLost := make(chan struct{})
 	var markLeaseLost sync.Once
-	go w.heartbeatLoopWithLeaseLoss(jobCtx, jobID, func() {
-		markLeaseLost.Do(func() {
-			close(leaseLost)
-			jobCancel()
-		})
-	})
+	heartbeatDone := make(chan struct{})
+	until := time.Now().Add(w.cfg.LeaseDuration)
+	if video.LeaseUntil != nil {
+		until = *video.LeaseUntil
+	}
+	go func() {
+		defer close(heartbeatDone)
+		w.heartbeatLoopWithLeaseLoss(jobCtx, jobID, func() {
+			markLeaseLost.Do(func() { close(leaseLost); jobCancel() })
+		}, until)
+	}()
+	defer func() { jobCancel(); <-heartbeatDone }()
+
 	hasLostLease := func() bool {
 		select {
 		case <-leaseLost:
@@ -284,8 +299,7 @@ func (w *Worker) processJob(ctx context.Context, video *Video) error {
 			return ErrLeaseConflict
 		}
 		if class := classifyYTDLPFailure(err); class != "" {
-			_ = w.quarantineJob(ctx, jobID, class)
-			return nil
+			return w.quarantineJob(ctx, jobID, class)
 		}
 		return fmt.Errorf("yt-dlp failed: %w", err)
 	}
@@ -315,6 +329,13 @@ func (w *Worker) processJob(ctx context.Context, video *Video) error {
 	}
 
 	remotePath := BuildRemotePath(video.YoutubeID, outputPath)
+	if destination, ok := w.cfg.Uploader.(interface{ Destination(string) string }); ok {
+		resp, e := w.postJSON(jobCtx, "/jobs/"+jobID+"/upload", map[string]string{"worker_id": w.cfg.WorkerID, "storage_path": destination.Destination(remotePath)})
+		if e != nil {
+			return fmt.Errorf("prepare upload: %w", e)
+		}
+		resp.Body.Close()
+	}
 	storagePath, err := w.cfg.Uploader.Upload(jobCtx, outputPath, remotePath)
 	if err != nil {
 		if hasLostLease() {
@@ -362,9 +383,7 @@ func (w *Worker) runYTDLP(ctx context.Context, youtubeID string, outputDir strin
 	w.logger.Info("running yt-dlp", "youtube_id", youtubeID, "args", args)
 
 	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
-	cmd.Stderr = os.Stderr
-
-	output, err := cmd.Output()
+	output, err := ytdlp.Output(cmd)
 	if err != nil {
 		return "", fmt.Errorf("yt-dlp exited with error: %w", err)
 	}
@@ -394,26 +413,50 @@ func (w *Worker) heartbeatLoop(ctx context.Context, jobID any) {
 	w.heartbeatLoopWithLeaseLoss(ctx, jobID, nil)
 }
 
-func (w *Worker) heartbeatLoopWithLeaseLoss(ctx context.Context, jobID any, onLeaseLost func()) {
+func (w *Worker) heartbeatLoopWithLeaseLoss(ctx context.Context, jobID any, onLeaseLost func(), initial ...time.Time) {
 	ticker := time.NewTicker(w.cfg.HeartbeatFreq)
 	defer ticker.Stop()
-
+	until := time.Now().Add(w.cfg.LeaseDuration)
+	if len(initial) > 0 {
+		until = initial[0]
+	}
+	expires := time.NewTimer(time.Until(until))
+	defer expires.Stop()
+	lost := func() {
+		if onLeaseLost != nil {
+			onLeaseLost()
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-expires.C:
+			lost()
+			return
 		case <-ticker.C:
-			// Send worker heartbeat
-			if err := w.sendHeartbeat(ctx); err != nil {
-				w.logger.Warn("heartbeat failed", "error", err)
+			request, cancel := context.WithDeadline(ctx, until)
+			if e := w.sendHeartbeat(request); e != nil {
+				w.logger.Warn("heartbeat failed", "error", e)
 			}
-			// Renew the lease
-			if err := w.renewLease(ctx, jobID); err != nil {
+			started := time.Now()
+			err := w.renewLease(request, jobID)
+			cancel()
+			if err != nil {
 				w.logger.Warn("lease renewal failed", "error", err)
-				if errors.Is(err, ErrLeaseConflict) && onLeaseLost != nil {
-					onLeaseLost()
+				if errors.Is(err, ErrLeaseConflict) || !time.Now().Before(until) {
+					lost()
 					return
 				}
+			} else {
+				until = started.Add(w.cfg.LeaseDuration)
+				if !expires.Stop() {
+					select {
+					case <-expires.C:
+					default:
+					}
+				}
+				expires.Reset(time.Until(until))
 			}
 		}
 	}

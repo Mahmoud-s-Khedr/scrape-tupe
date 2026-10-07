@@ -12,6 +12,7 @@ type Source struct {
 	Kind                      string     `json:"kind"`
 	State                     string     `json:"state"`
 	Error                     *string    `json:"error,omitempty"`
+	DiscoveryComplete         bool       `json:"discovery_complete"`
 	DiscoveryCursor           int        `json:"discovery_cursor"`
 	DiscoveredCount           int        `json:"discovered_count"`
 	NormalizedCount           int        `json:"normalized_count"`
@@ -38,10 +39,10 @@ func (db *DB) CreateSource(ctx context.Context, url, kind string) (int64, error)
 }
 
 func (db *DB) GetSource(ctx context.Context, id int64) (*Source, error) {
-	query := `SELECT id, url, kind, state, error, discovery_cursor, discovered_count, normalized_count, quarantined_count, worker_id, lease_until, attempt_count, retry_at, authorization_acknowledged, created_at, updated_at FROM sources WHERE id = ?`
+	query := `SELECT id, url, kind, state, error, discovery_cursor, discovered_count, normalized_count, quarantined_count, worker_id, lease_until, attempt_count, retry_at, authorization_acknowledged, discovery_complete, created_at, updated_at FROM sources WHERE id = ?`
 	var s Source
 	err := db.QueryRowContext(ctx, query, id).Scan(
-		&s.ID, &s.URL, &s.Kind, &s.State, &s.Error, &s.DiscoveryCursor, &s.DiscoveredCount, &s.NormalizedCount, &s.QuarantinedCount, &s.WorkerID, &s.LeaseUntil, &s.AttemptCount, &s.RetryAt, &s.AuthorizationAcknowledged, &s.CreatedAt, &s.UpdatedAt,
+		&s.ID, &s.URL, &s.Kind, &s.State, &s.Error, &s.DiscoveryCursor, &s.DiscoveredCount, &s.NormalizedCount, &s.QuarantinedCount, &s.WorkerID, &s.LeaseUntil, &s.AttemptCount, &s.RetryAt, &s.AuthorizationAcknowledged, &s.DiscoveryComplete, &s.CreatedAt, &s.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -50,7 +51,7 @@ func (db *DB) GetSource(ctx context.Context, id int64) (*Source, error) {
 }
 
 func (db *DB) ListSources(ctx context.Context) ([]Source, error) {
-	query := `SELECT id, url, kind, state, error, discovery_cursor, discovered_count, normalized_count, quarantined_count, worker_id, lease_until, attempt_count, retry_at, authorization_acknowledged, created_at, updated_at FROM sources`
+	query := `SELECT id, url, kind, state, error, discovery_cursor, discovered_count, normalized_count, quarantined_count, worker_id, lease_until, attempt_count, retry_at, authorization_acknowledged, discovery_complete, created_at, updated_at FROM sources`
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
@@ -60,7 +61,7 @@ func (db *DB) ListSources(ctx context.Context) ([]Source, error) {
 	var sources []Source
 	for rows.Next() {
 		var s Source
-		if err := rows.Scan(&s.ID, &s.URL, &s.Kind, &s.State, &s.Error, &s.DiscoveryCursor, &s.DiscoveredCount, &s.NormalizedCount, &s.QuarantinedCount, &s.WorkerID, &s.LeaseUntil, &s.AttemptCount, &s.RetryAt, &s.AuthorizationAcknowledged, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.URL, &s.Kind, &s.State, &s.Error, &s.DiscoveryCursor, &s.DiscoveredCount, &s.NormalizedCount, &s.QuarantinedCount, &s.WorkerID, &s.LeaseUntil, &s.AttemptCount, &s.RetryAt, &s.AuthorizationAcknowledged, &s.DiscoveryComplete, &s.CreatedAt, &s.UpdatedAt); err != nil {
 			return nil, err
 		}
 		sources = append(sources, s)

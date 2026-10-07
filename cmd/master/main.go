@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -49,6 +50,14 @@ func main() {
 			logger.Error("failed to open Firestore", "error", err)
 			os.Exit(1)
 		}
+		size, err := strconv.ParseInt(envOr("UNKNOWN_SIZE_RESERVATION_BYTES", "536870912"), 10, 64)
+		if err == nil {
+			err = store.SetUnknownSizeReservation(size)
+		}
+		if err != nil {
+			logger.Error("invalid unknown size reservation", "error", err)
+			os.Exit(1)
+		}
 		backend, closer = store, store
 	default:
 		logger.Error("unknown control store", "store", *storeKind)
@@ -64,6 +73,14 @@ func main() {
 		os.Exit(1)
 	}
 	if *storeKind == "firestore" {
+		artifacts, err := gcp.NewGCSArtifactInspector(context.Background(), envOr("GCS_BUCKET", ""))
+		if err != nil {
+			logger.Error("failed to configure artifact accounting", "error", err)
+			os.Exit(1)
+		}
+		defer artifacts.Close()
+		srv.SetArtifactInspector(artifacts)
+
 		jobs, err := gcp.NewCloudRunJobs(context.Background(), *projectID, envOr("GCP_REGION", "us-central1"), envOr("DISCOVERY_JOB", "scrape-tupe-discovery"), envOr("NORMALIZER_JOB", "scrape-tupe-normalizer"), envOr("DOWNLOADER_JOB", "scrape-tupe-downloader"), 45*time.Minute)
 		if err != nil {
 			logger.Error("failed to configure Cloud Run Jobs client", "error", err)

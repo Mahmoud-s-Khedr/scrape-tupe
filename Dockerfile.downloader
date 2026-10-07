@@ -1,24 +1,28 @@
 # syntax=docker/dockerfile:1
-ARG YT_DLP_VERSION=2025.10.14
+ARG YT_DLP_VERSION=2026.8.19
 ARG DENO_VERSION=2.5.0
 
 FROM golang:1.26.8-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=secret,id=proxy_ca \
+    if [ -f /run/secrets/proxy_ca ]; then export SSL_CERT_FILE=/run/secrets/proxy_ca; fi; \
+    go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/downloader ./cmd/downloader
+RUN --mount=type=cache,target=/root/.cache/go-build CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/downloader ./cmd/downloader
 
 FROM python:3.13-slim-bookworm
 ARG YT_DLP_VERSION
 ARG DENO_VERSION
-RUN apt-get update \
+RUN --mount=type=secret,id=proxy_ca \
+    if [ -f /run/secrets/proxy_ca ]; then export SSL_CERT_FILE=/run/secrets/proxy_ca CURL_CA_BUNDLE=/run/secrets/proxy_ca PIP_CERT=/run/secrets/proxy_ca; fi; \
+    apt-get update \
     && apt-get install --no-install-recommends -y ffmpeg curl unzip \
     && curl -fsSL "https://github.com/denoland/deno/releases/download/v${DENO_VERSION}/deno-x86_64-unknown-linux-gnu.zip" -o /tmp/deno.zip \
     && unzip -q /tmp/deno.zip -d /usr/local/bin \
     && chmod 755 /usr/local/bin/deno \
     && rm -f /tmp/deno.zip \
-    && python -m pip install --no-cache-dir "yt-dlp==${YT_DLP_VERSION}" \
+    && python -m pip install --no-cache-dir "yt-dlp[default]==${YT_DLP_VERSION}" \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/downloader /downloader
@@ -26,5 +30,6 @@ ENV OUTPUT_DIR=/tmp/scrape-tupe/downloads \
     STORAGE_BACKEND=gcs \
     EXIT_WHEN_EMPTY=true \
     CLEANUP_TEMP=true
+ENV DENO_DIR=/tmp/deno
 USER 65532:65532
 ENTRYPOINT ["/downloader"]

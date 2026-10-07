@@ -31,3 +31,6 @@ test-images:
 	docker run --rm --entrypoint deno scrape-tupe-downloader:smoke --version
 	docker run --rm --entrypoint yt-dlp scrape-tupe-downloader:smoke --version
 	docker run --rm --entrypoint ffmpeg scrape-tupe-downloader:smoke -version
+
+	docker run --rm -e NO_PROXY=127.0.0.1,localhost -e no_proxy=127.0.0.1,localhost --mount type=bind,src=$(CURDIR)/scripts/smoke_ytdlp.py,dst=/smoke.py,readonly --entrypoint python scrape-tupe-normalizer:smoke /smoke.py
+	docker run --rm -e NO_PROXY=127.0.0.1,localhost -e no_proxy=127.0.0.1,localhost --mount type=bind,src=$(CURDIR)/scripts/smoke_ytdlp.py,dst=/smoke.py,readonly --entrypoint python scrape-tupe-downloader:smoke /smoke.py

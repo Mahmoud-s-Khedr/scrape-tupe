@@ -16,6 +16,9 @@ type Scaler struct {
 // intent is committed before RunJob. If the API outcome is ambiguous, it stays
 // "launching" and subsequent ticks fail closed instead of overlapping batches.
 func (s *Server) Reconcile(ctx context.Context) error {
+	if err := s.reconcileArtifacts(ctx); err != nil {
+		return err
+	}
 	if s.jobs == nil {
 		return nil
 	}
@@ -74,6 +77,17 @@ func (s *Server) Reconcile(ctx context.Context) error {
 	pending := counts["pending"]
 	if pending == 0 {
 		return nil
+	}
+	if ready, ok := s.store.(interface {
+		CanDownload(context.Context) (bool, error)
+	}); ok {
+		can, e := ready.CanDownload(ctx)
+		if e != nil {
+			return e
+		}
+		if !can {
+			return nil
+		}
 	}
 	if pending > 10 {
 		pending = 10

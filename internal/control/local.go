@@ -22,7 +22,7 @@ func sourceFrom(s *db.Source) *Source {
 	if state == "pending" {
 		state = "queued"
 	}
-	return &Source{ID: strconv.FormatInt(s.ID, 10), URL: s.URL, Kind: s.Kind, AuthorizationAcknowledged: s.AuthorizationAcknowledged, State: state, Error: deref(s.Error), DiscoveryCursor: s.DiscoveryCursor, DiscoveredCount: s.DiscoveredCount, NormalizedCount: s.NormalizedCount, QuarantinedCount: s.QuarantinedCount, WorkerID: deref(s.WorkerID), LeaseUntil: s.LeaseUntil, AttemptCount: s.AttemptCount, RetryAt: s.RetryAt, CreatedAt: s.CreatedAt, UpdatedAt: s.UpdatedAt}
+	return &Source{ID: strconv.FormatInt(s.ID, 10), URL: s.URL, Kind: s.Kind, AuthorizationAcknowledged: s.AuthorizationAcknowledged, State: state, Error: deref(s.Error), DiscoveryComplete: s.DiscoveryComplete, DiscoveryCursor: s.DiscoveryCursor, DiscoveredCount: s.DiscoveredCount, NormalizedCount: s.NormalizedCount, QuarantinedCount: s.QuarantinedCount, WorkerID: deref(s.WorkerID), LeaseUntil: s.LeaseUntil, AttemptCount: s.AttemptCount, RetryAt: s.RetryAt, CreatedAt: s.CreatedAt, UpdatedAt: s.UpdatedAt}
 }
 func (s *LocalStore) videoFrom(ctx context.Context, v *db.Video) (*Video, error) {
 	rows, err := s.DB.QueryContext(ctx, `SELECT source_id FROM video_sources WHERE video_id=? ORDER BY source_id`, v.ID)
@@ -116,9 +116,20 @@ func (s *LocalStore) RetrySource(ctx context.Context, id string) error {
 		return err
 	}
 	defer tx.Rollback()
-	var kind string
-	if err = tx.QueryRowContext(ctx, `SELECT kind FROM sources WHERE id=?`, n).Scan(&kind); err != nil {
+	var kind, state string
+	var complete bool
+	if err = tx.QueryRowContext(ctx, `SELECT kind,state,discovery_complete FROM sources WHERE id=?`, n).Scan(&kind, &state, &complete); err != nil {
 		return err
+	}
+	if state != "error" && state != "quarantined" {
+		return ErrInvalidState
+	}
+	if (kind == "channel" || kind == "playlist") && !complete {
+		_, err = tx.ExecContext(ctx, `UPDATE sources SET state='queued', error=NULL,retry_at=NULL,worker_id=NULL,lease_until=NULL WHERE id=?`, n)
+		if err != nil {
+			return err
+		}
+		return tx.Commit()
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE raw_urls SET state='pending', worker_id=NULL, lease_until=NULL, retry_at=NULL, error=NULL, error_class=NULL, terminal_at=NULL, updated_at=datetime('now') WHERE source_id=? AND state='quarantined'`, n); err != nil {
 		return err
@@ -171,28 +182,30 @@ func (s *LocalStore) CheckpointDiscovery(ctx context.Context, id, worker string,
 	if owner != worker || until == nil || !until.After(time.Now()) {
 		return ErrLeaseNotOwned
 	}
-	if index < cursor {
+	var existing int
+	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM raw_urls WHERE source_id=? AND raw_url=?`, n, raw).Scan(&existing); err != nil {
+		return err
+	}
+	if existing != 0 {
 		return tx.Commit()
 	}
-	if index != cursor {
-		return ErrInvalidState
-	}
-	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO raw_urls(id,source_id,source_index,raw_url) VALUES(?,?,?,?)`, uuid.NewString(), n, index, raw)
+	_, err = tx.ExecContext(ctx, `INSERT INTO raw_urls(id,source_id,source_index,raw_url) VALUES(?,?,?,?)`, uuid.NewString(), n, cursor, raw)
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE sources SET discovery_cursor=?, discovered_count=discovered_count+1, updated_at=datetime('now') WHERE id=?`, index+1, n)
+	_, err = tx.ExecContext(ctx, `UPDATE sources SET discovery_cursor=discovery_cursor+1, discovered_count=discovered_count+1, updated_at=datetime('now') WHERE id=?`, n)
 	if err != nil {
 		return err
 	}
 	return tx.Commit()
 }
+
 func (s *LocalStore) FinishDiscovery(ctx context.Context, id, worker string) error {
 	n, e := sourceID(id)
 	if e != nil {
 		return ErrNotFound
 	}
-	r, e := s.DB.ExecContext(ctx, `UPDATE sources SET state='normalizing',worker_id=NULL,lease_until=NULL,error=NULL,retry_at=NULL,updated_at=datetime('now') WHERE id=? AND worker_id=? AND state='discovering' AND julianday(lease_until)>julianday('now')`, n, worker)
+	r, e := s.DB.ExecContext(ctx, `UPDATE sources SET state=CASE WHEN discovered_count=0 THEN 'normalized' ELSE 'normalizing' END,discovery_complete=1,worker_id=NULL,lease_until=NULL,error=NULL,retry_at=NULL,updated_at=datetime('now') WHERE id=? AND worker_id=? AND state='discovering' AND julianday(lease_until)>julianday('now')`, n, worker)
 	if e != nil {
 		return e
 	}
@@ -211,7 +224,7 @@ func (s *LocalStore) FailDiscovery(ctx context.Context, id, worker string, retry
 	if !retryable {
 		state = "quarantined"
 	}
-	r, e := s.DB.ExecContext(ctx, `UPDATE sources SET state=?,worker_id=NULL,lease_until=NULL,error=?,retry_at=?, updated_at=datetime('now') WHERE id=? AND worker_id=?`, state, msg, sqliteTime(retryAt), n, worker)
+	r, e := s.DB.ExecContext(ctx, `UPDATE sources SET state=?,worker_id=NULL,lease_until=NULL,error=?,retry_at=?, updated_at=datetime('now') WHERE id=? AND worker_id=? AND state='discovering' AND julianday(lease_until)>julianday('now')`, state, msg, sqliteTime(retryAt), n, worker)
 	if e != nil {
 		return e
 	}
@@ -289,7 +302,7 @@ func (s *LocalStore) ReleaseRawURL(ctx context.Context, id, worker string, retry
 	}
 	defer tx.Rollback()
 	var sid int64
-	if e = tx.QueryRowContext(ctx, `SELECT source_id FROM raw_urls WHERE id=? AND worker_id=? AND state='leased'`, id, worker).Scan(&sid); e != nil {
+	if e = tx.QueryRowContext(ctx, `SELECT source_id FROM raw_urls WHERE id=? AND worker_id=? AND state='leased' AND julianday(lease_until)>julianday('now')`, id, worker).Scan(&sid); e != nil {
 		if e == sql.ErrNoRows {
 			return ErrLeaseNotOwned
 		}
@@ -430,6 +443,14 @@ func (s *LocalStore) RecoverExpiredLeases(ctx context.Context) (int, error) {
 // source has been discovered. Counts are recomputed (rather than incremented)
 // so retries and lease recovery remain idempotent.
 func deriveSourceStateTx(ctx context.Context, tx *sql.Tx, sourceID int64) error {
+	var kind string
+	var complete bool
+	if err := tx.QueryRowContext(ctx, `SELECT kind,discovery_complete FROM sources WHERE id=?`, sourceID).Scan(&kind, &complete); err != nil {
+		return err
+	}
+	if kind != "video" && !complete {
+		return nil
+	}
 	var total, normalized, quarantined int
 	if err := tx.QueryRowContext(ctx, `SELECT count(*), COALESCE(sum(CASE WHEN state='normalized' THEN 1 ELSE 0 END),0), COALESCE(sum(CASE WHEN state='quarantined' THEN 1 ELSE 0 END),0) FROM raw_urls WHERE source_id=?`, sourceID).Scan(&total, &normalized, &quarantined); err != nil {
 		return err

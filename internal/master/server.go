@@ -22,6 +22,7 @@ type Server struct {
 	workerAudience string
 	workerEmails   map[string]bool
 	validateToken  TokenValidator
+	artifacts      control.ArtifactInspector
 }
 
 // TokenValidator verifies a token for the supplied audience and returns the
@@ -115,6 +116,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("POST /jobs/claim", s.handleClaimJob)
 	mux.HandleFunc("POST /jobs/{id}/state", s.handleUpdateJobState)
+	mux.HandleFunc("POST /jobs/{id}/upload", s.handlePrepareUpload)
 	mux.HandleFunc("POST /jobs/{id}/complete", s.handleCompleteJob)
 	mux.HandleFunc("POST /jobs/{id}/renew", s.handleRenewJob)
 	mux.HandleFunc("POST /jobs/{id}/quarantine", s.handleQuarantineJob)
@@ -123,6 +125,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /internal/reconcile", s.handleReconcile)
 	mux.HandleFunc("POST /normalizer/discovery/claim", s.handleClaimDiscovery)
 	mux.HandleFunc("POST /normalizer/discovery/{id}/checkpoint", s.handleDiscoveryCheckpoint)
+	mux.HandleFunc("POST /normalizer/discovery/{id}/renew", s.handleDiscoveryRenew)
+	mux.HandleFunc("POST /normalizer/urls/{id}/renew", s.handleRawRenew)
 	mux.HandleFunc("POST /normalizer/discovery/{id}/complete", s.handleDiscoveryComplete)
 	mux.HandleFunc("POST /normalizer/discovery/{id}/failure", s.handleDiscoveryFailure)
 	mux.HandleFunc("POST /normalizer/urls/claim", s.handleClaimRawURL)
@@ -202,3 +206,5 @@ func (s *Server) recoverExpiredLeases(ctx context.Context) {
 		s.logger.Info("recovered expired job leases", "count", count)
 	}
 }
+
+func (s *Server) SetArtifactInspector(i control.ArtifactInspector) { s.artifacts = i }

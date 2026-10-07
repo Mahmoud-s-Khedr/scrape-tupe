@@ -184,6 +184,10 @@ resource "google_cloud_run_v2_service" "master" {
     containers {
       image = var.master_image
       env {
+        name  = "GCS_BUCKET"
+        value = google_storage_bucket.artifacts.name
+      }
+      env {
         name  = "MASTER_STORE"
         value = "firestore"
       }
@@ -363,5 +367,20 @@ resource "google_cloud_run_v2_job" "downloader" {
         }
       }
     }
+  }
+}
+
+resource "google_project_iam_custom_role" "master_artifacts" {
+  role_id     = "scrapeTupeArtifactInspector"
+  title       = "Scrape-Tupe artifact metadata reader"
+  permissions = ["storage.objects.get"]
+}
+resource "google_storage_bucket_iam_member" "master_artifacts" {
+  bucket = google_storage_bucket.artifacts.name
+  role   = google_project_iam_custom_role.master_artifacts.name
+  member = "serviceAccount:${google_service_account.master.email}"
+  condition {
+    title      = "videos_only"
+    expression = "resource.name.startsWith('projects/_/buckets/${google_storage_bucket.artifacts.name}/objects/videos/')"
   }
 }

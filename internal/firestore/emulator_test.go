@@ -4,6 +4,7 @@ package firestore
 
 import (
 	"context"
+	"github.com/google/uuid"
 	"os"
 	"testing"
 	"time"
@@ -16,7 +17,7 @@ func emulatorStore(t *testing.T) *Store {
 	if os.Getenv("FIRESTORE_EMULATOR_HOST") == "" {
 		t.Skip("FIRESTORE_EMULATOR_HOST is required")
 	}
-	s, err := New(context.Background(), "scrape-tupe-test")
+	s, err := New(context.Background(), "scrape-tupe-"+uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
 	}
