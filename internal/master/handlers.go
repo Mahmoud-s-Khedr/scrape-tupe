@@ -215,9 +215,36 @@ func (s *Server) handleCompleteJob(w http.ResponseWriter, r *http.Request) {
 		sendError(w, 400, "invalid request body")
 		return
 	}
+	var observation control.ArtifactObservation
+	if _, ok := s.store.(control.ArtifactStore); ok {
+		if s.artifacts == nil {
+			sendError(w, 503, "artifact inspector is required")
+			return
+		}
+		var err error
+		observation, err = s.artifacts.InspectArtifact(r.Context(), req.StoragePath)
+		if err != nil {
+			sendError(w, 503, "cannot verify artifact")
+			return
+		}
+		if !observation.Exists || observation.Size != req.ActualSize {
+			sendError(w, 400, "artifact size does not match completion")
+			return
+		}
+	}
 	if e := s.store.CompleteVideo(r.Context(), r.PathValue("id"), req.WorkerID, req.StoragePath, req.ActualSize); e != nil {
 		workerError(w, e)
 		return
+	}
+	if store, ok := s.store.(control.ArtifactStore); ok {
+		v, err := s.store.GetVideo(r.Context(), r.PathValue("id"))
+		if err == nil {
+			err = store.ObserveArtifact(r.Context(), *v, observation)
+		}
+		if err != nil {
+			sendError(w, 500, "failed to record object identity")
+			return
+		}
 	}
 	sendJSON(w, 200, map[string]string{"status": "ok"})
 }
@@ -454,4 +481,56 @@ func (s *Server) handleRawURLFailure(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sendJSON(w, 200, map[string]string{"status": "released"})
+}
+
+func (s *Server) normalizerRenew(w http.ResponseWriter, r *http.Request, discovery bool) {
+	var req normalizerClaimReq
+	if json.NewDecoder(r.Body).Decode(&req) != nil || req.WorkerID == "" {
+		sendError(w, 400, "invalid request body")
+		return
+	}
+	var e error
+	if discovery {
+		e = s.store.RenewDiscovery(r.Context(), r.PathValue("id"), req.WorkerID, normalizerLease(req.LeaseDuration))
+	} else {
+		e = s.store.RenewRawURL(r.Context(), r.PathValue("id"), req.WorkerID, normalizerLease(req.LeaseDuration))
+	}
+	if e != nil {
+		workerError(w, e)
+		return
+	}
+	sendJSON(w, 200, map[string]string{"status": "renewed"})
+}
+func (s *Server) handleDiscoveryRenew(w http.ResponseWriter, r *http.Request) {
+	s.normalizerRenew(w, r, true)
+}
+func (s *Server) handleRawRenew(w http.ResponseWriter, r *http.Request) {
+	s.normalizerRenew(w, r, false)
+}
+
+func (s *Server) handlePrepareUpload(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		WorkerID    string `json:"worker_id"`
+		StoragePath string `json:"storage_path"`
+	}
+	if json.NewDecoder(r.Body).Decode(&req) != nil || req.WorkerID == "" || req.StoragePath == "" {
+		sendError(w, 400, "invalid upload intent")
+		return
+	}
+	if store, ok := s.store.(control.ArtifactStore); ok {
+		if s.artifacts == nil {
+			sendError(w, 503, "artifact inspector is required")
+			return
+		}
+		// Validating the destination happens before the worker may create the object.
+		if _, err := s.artifacts.InspectArtifact(r.Context(), req.StoragePath); err != nil {
+			sendError(w, 400, "invalid or inaccessible artifact destination")
+			return
+		}
+		if err := store.PrepareUpload(r.Context(), r.PathValue("id"), req.WorkerID, req.StoragePath); err != nil {
+			workerError(w, err)
+			return
+		}
+	}
+	sendJSON(w, 200, map[string]string{"status": "prepared"})
 }

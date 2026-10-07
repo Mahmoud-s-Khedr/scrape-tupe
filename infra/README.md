@@ -17,6 +17,12 @@ budget is an alert only; it does not stop resource usage. Downloader jobs have
 configured by the platform default (10 GiB); verify the relevant project quota
 before enabling a production batch of ten concurrent tasks.
 
+The master requires the artifact bucket name and metadata-read permission for
+retention accounting; this module supplies both. Drain old worker executions
+before upgrading: current GCS workers register upload intents through the master
+before creating objects. See [operations and recovery](../docs/operations.md)
+for the settlement period, expired artifact status, and legacy-object review.
+
 The deployment keeps Cloud Run's default dynamic outbound egress. It does not
 promise one public IP per task and deliberately contains no IP rotation logic.
 If a legitimate integration later needs static egress, add Direct VPC egress

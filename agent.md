@@ -4,13 +4,13 @@
 
 ## Project Overview
 
-Scrape-Tupe is migrating to a Cloud Run Jobs and Cloud Storage video-download pipeline. The authoritative migration design is [`docs/gcp-migration-report.md`](docs/gcp-migration-report.md). SQLite remains only a local-development adapter until the Firestore control plane is implemented.
+Scrape-Tupe is migrating to a Cloud Run Jobs and Cloud Storage video-download pipeline. The authoritative migration design is [`docs/gcp-migration-report.md`](docs/gcp-migration-report.md). Firestore is the production control plane. SQLite remains a local-development adapter; see `docs/operations.md` for queue, lease, upload-intent, and retention behavior.
 
 ## Architecture
 
 Three logical components:
 
-- **Master** — HTTP API server that will own Firestore state, manage workers/jobs, and start bounded Cloud Run Job executions.
+- **Master** — HTTP API server owning Firestore state, managing execution guards, reconciling artifacts, and starting bounded Cloud Run Job executions.
 - **Normalizer** — Accepts channel/playlist/video URLs, expands them into individual video records via yt-dlp metadata extraction.
 - **Downloader** — bounded Cloud Run Job task that claims jobs, downloads with yt-dlp, uploads to Cloud Storage, then exits when the queue drains.
 
@@ -23,10 +23,12 @@ cmd/
   normalizer/     — Normalizer entry point
 internal/
   db/             — SQLite local-development database layer (to be replaced by Firestore)
-  master/         — Master HTTP handlers, server, scaler
+  master/         — Master HTTP handlers, server, reconciliation
   downloader/     — Downloader task logic (yt-dlp integration, leases, upload abstraction)
-  normalizer/     — Normalizer logic (placeholder)
-  gcp/            — Google Cloud integrations (Cloud Storage today; Run/Firestore next)
+  normalizer/     — Discovery, metadata extraction, renewable task leases
+  gcp/            — Cloud Storage uploads/inspection and Cloud Run Jobs
+  firestore/      — Production transactional control plane
+  ytdlp/          — Bounded subprocess diagnostics and cancellation
 docs/
   plan.md         — Full build plan with phases and architecture
 ```
@@ -52,18 +54,18 @@ docs/
 
 ## Current Progress
 
-- **Phase 1 ✅** — SQLite schema + Master HTTP API
-- **Phase 2 ✅** — Single local downloader with yt-dlp
-- **Phase A (in progress)** — GCS upload integration, bounded downloader tasks, and container images
-- **Phase 4 ⬜** — Normalizer (channel/playlist/video expansion)
-- **Next** — Firestore transactions/counters, Cloud Run Job execution guard/client, and Terraform deployment
+- SQLite development adapter and master HTTP API are implemented.
+- Discovery/URL normalization and downloader workers use lease-owned HTTP operations.
+- Firestore transactions, counters, guarded Cloud Run executions, GCS uploads, and Terraform resources are implemented.
+- Review remediation adds compatible tools, queue scan progress, URL replay deduplication, lease renewal, diagnostics, and retention accounting.
+- Local unit/race/emulator/image checks precede live GCP validation and release; see `docs/gcp-migration-next-steps.md`.
 
 ## Key Design Decisions
 
 1. **Pull-based job distribution** — Workers pull jobs from master; master never pushes.
 2. **Lease-based fault tolerance** — Every claimed job has a renewable lease; expired leases are auto-recovered.
 3. **Master launches bounded batches** — Calculates pending work and starts one guarded Cloud Run Job execution capped at `MAX_PARALLELISM`.
-4. **SIGTERM handling** — Downloader releases lease on graceful shutdown; lease expiry is the fallback.
+4. **Cancellation** — Workers cancel subprocess groups on lost ownership. Lease expiry recovers abandoned work; upload intents keep capacity reserved until artifact reconciliation settles their outcome.
 
 ## Build & Run
 

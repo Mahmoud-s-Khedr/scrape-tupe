@@ -39,6 +39,18 @@ func Open(path string) (*DB, error) {
 // upgradeSchema keeps the embedded schema useful for brand-new databases while
 // making releases safe for databases created before a column/table existed.
 func upgradeSchema(db *sql.DB) error {
+	var complete int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('sources') WHERE name='discovery_complete'`).Scan(&complete); err != nil {
+		return err
+	}
+	if complete == 0 {
+		if _, err := db.Exec(`ALTER TABLE sources ADD COLUMN discovery_complete INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`UPDATE sources SET discovery_complete=1 WHERE state IN ('normalizing','normalized','discovered') OR (state='quarantined' AND EXISTS(SELECT 1 FROM raw_urls WHERE source_id=sources.id AND state='quarantined'))`); err != nil {
+			return err
+		}
+	}
 	var acknowledged int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('sources') WHERE name='authorization_acknowledged'`).Scan(&acknowledged); err != nil {
 		return err

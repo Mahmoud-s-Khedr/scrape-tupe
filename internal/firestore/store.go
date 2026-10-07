@@ -3,6 +3,7 @@ package firestore
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"time"
@@ -19,8 +20,9 @@ import (
 const countersDoc = "artifacts"
 
 type Store struct {
-	client *cloudfs.Client
-	now    func() time.Time
+	client                 *cloudfs.Client
+	now                    func() time.Time
+	unknownSizeReservation int64
 }
 
 func New(ctx context.Context, projectID string) (*Store, error) {
@@ -113,6 +115,9 @@ func decodeSource(snap *cloudfs.DocumentSnapshot) (*control.Source, error) {
 		return nil, e
 	}
 	out.ID = snap.Ref.ID
+	if _, present := snap.Data()["discovery_complete"]; !present && (out.State == "normalizing" || out.State == "normalized" || out.State == "discovered") {
+		out.DiscoveryComplete = true
+	}
 	return &out, nil
 }
 func decodeVideo(snap *cloudfs.DocumentSnapshot) (*control.Video, error) {
@@ -198,7 +203,10 @@ func (s *Store) RetrySource(ctx context.Context, id string) error {
 		if e != nil {
 			return e
 		}
-		if retryCount > 0 {
+		if _, present := snap.Data()["discovery_complete"]; !present && retryCount > 0 {
+			x.DiscoveryComplete = true
+		}
+		if retryCount > 0 && (x.Kind == "video" || x.DiscoveryComplete) {
 			derived, e := s.deriveSourceStateTx(ctx, tx, id, rawStates(raws, "pending"))
 			if e != nil {
 				return e
@@ -219,11 +227,17 @@ func (s *Store) RetrySource(ctx context.Context, id string) error {
 			}
 			return nil
 		}
+		if x.Kind == "video" {
+			return control.ErrInvalidState
+		}
 		x.State = "queued"
 		x.Error = ""
-		x.QuarantinedUntil = nil
+		x.RetryAt, x.QuarantinedUntil = nil, nil
 		x.UpdatedAt = s.now()
-		return tx.Set(s.source(id), x)
+		if e = tx.Set(s.source(id), x); e != nil {
+			return e
+		}
+		return s.counterDelta(tx, counters, map[string]int64{"discoverable_sources": 1})
 	})
 }
 
@@ -291,18 +305,22 @@ func (s *Store) CheckpointDiscovery(ctx context.Context, sourceID, worker string
 		if src.State != "discovering" || src.WorkerID != worker || src.LeaseUntil == nil || !src.LeaseUntil.After(s.now()) {
 			return control.ErrLeaseNotOwned
 		}
-		if index < src.DiscoveryCursor {
+		// Match legacy opaque records too; new rows use stable URL keys.
+		it := tx.Documents(s.client.Collection("raw_urls").Where("source_id", "==", sourceID).Where("raw_url", "==", rawURL).Limit(1))
+		_, e = it.Next()
+		it.Stop()
+		if e == nil {
 			return nil
 		}
-		if index != src.DiscoveryCursor {
-			return control.ErrInvalidState
+		if e != iterator.Done {
+			return e
 		}
 		counters, e := s.counterValues(tx)
 		if e != nil {
 			return e
 		}
 		now := s.now()
-		raw := control.RawURL{ID: uuid.NewString(), SourceID: sourceID, Index: index, RawURL: rawURL, State: "pending", CreatedAt: now, UpdatedAt: now}
+		raw := control.RawURL{ID: fmt.Sprintf("%x", sha256.Sum256([]byte(sourceID+"\x00"+rawURL))), SourceID: sourceID, Index: src.DiscoveredCount, RawURL: rawURL, State: "pending", CreatedAt: now, UpdatedAt: now}
 		// The document ID and payload ID must be identical: workers receive the
 		// latter and completion looks up the former.
 		if e = tx.Create(s.raw(raw.ID), raw); e != nil {
@@ -331,6 +349,10 @@ func (s *Store) FinishDiscovery(ctx context.Context, sourceID, worker string) er
 			return control.ErrLeaseNotOwned
 		}
 		x.State = "normalizing"
+		if x.DiscoveredCount == 0 {
+			x.State = "normalized"
+		}
+		x.DiscoveryComplete = true
 		x.WorkerID = ""
 		x.LeaseUntil = nil
 		x.Error = ""
@@ -348,7 +370,7 @@ func (s *Store) FailDiscovery(ctx context.Context, sourceID, worker string, retr
 		if e != nil {
 			return e
 		}
-		if x.WorkerID != worker {
+		if x.State != "discovering" || x.WorkerID != worker || x.LeaseUntil == nil || !x.LeaseUntil.After(s.now()) {
 			return control.ErrLeaseNotOwned
 		}
 		counters, e := s.counterValues(tx)
@@ -522,7 +544,7 @@ func (s *Store) ReleaseRawURL(ctx context.Context, id, worker string, retryable 
 		if e != nil {
 			return e
 		}
-		if raw.WorkerID != worker {
+		if raw.State != "leased" || raw.WorkerID != worker || raw.LeaseUntil == nil || !raw.LeaseUntil.After(s.now()) {
 			return control.ErrLeaseNotOwned
 		}
 		quarantine := !retryable || raw.AttemptCount >= 3
@@ -596,53 +618,134 @@ func (s *Store) ListVideos(ctx context.Context, state string) ([]control.Video, 
 		out = append(out, *v)
 	}
 }
-func (s *Store) ClaimVideo(ctx context.Context, worker string, lease time.Duration) (*control.Video, error) {
+
+// scanDownload persists its cursor even when no candidate fits. Bounded scans
+// therefore cannot permanently hide work behind an arbitrarily long blocked prefix.
+func (s *Store) scanDownload(ctx context.Context, worker string, lease time.Duration, reserve bool) (*control.Video, error) {
 	var out *control.Video
+	var result error
 	err := s.client.RunTransaction(ctx, func(ctx context.Context, tx *cloudfs.Transaction) error {
-		it := tx.Documents(s.client.Collection("videos").Where("state", "==", "pending").OrderBy("created_at", cloudfs.Asc).Limit(10))
+		out = nil
+		result = control.ErrNotFound
+		values, e := s.counterValues(tx)
+		if e != nil {
+			return e
+		}
+		cursorRef := s.client.Collection("queue_scans").Doc("downloader")
+		cursor, e := tx.Get(cursorRef)
+		if e != nil && !isNotFound(e) {
+			return e
+		}
+		q := s.client.Collection("videos").Where("state", "==", "pending").OrderBy("created_at", cloudfs.Asc).OrderBy(cloudfs.DocumentID, cloudfs.Asc).Limit(64)
+		base := q
+		startedAfter := false
+		if e == nil {
+			created, ok := cursor.Data()["created_at"].(time.Time)
+			id, _ := cursor.Data()["video_id"].(string)
+			if ok && id != "" {
+				q = q.StartAfter(created, s.video(id))
+				startedAfter = true
+			}
+		}
+		it := tx.Documents(q)
 		defer it.Stop()
-		var selected *cloudfs.DocumentSnapshot
-		for {
+		var last *control.Video
+		var oversized []*control.Video
+		for i := 0; i < 64; i++ {
 			snap, e := it.Next()
 			if e == iterator.Done {
+				if i == 0 && startedAfter {
+					it.Stop()
+					it = tx.Documents(base)
+					defer it.Stop()
+					startedAfter = false
+					i--
+					continue
+				}
+				last = nil
 				break
 			}
 			if e != nil {
 				return e
 			}
-			selected = snap
+			v, e := decodeVideo(snap)
+			if e != nil {
+				return e
+			}
+			last = v
+			size := v.EstimatedSize
+			if size <= 0 {
+				size = s.unknownSizeReservation
+				if size <= 0 {
+					size = control.UnknownSizeReservationBytes
+				}
+			}
+			if size > control.ArtifactBudgetBytes {
+				oversized = append(oversized, v)
+				continue
+			}
+			result = control.ErrCapacity
+			if size > control.ArtifactBudgetBytes-values["used_bytes"]-values["reserved_bytes"] {
+				continue
+			}
+			v.EstimatedSize = size
+			out = v
+			result = nil
 			break
 		}
-		if selected == nil {
-			return control.ErrNotFound
+		// All reads precede writes, including repairs to permanently unsuitable records.
+		for _, v := range oversized {
+			v.State = "error"
+			v.Error = "estimated size exceeds total artifact budget"
+			v.ErrorClass = "oversized"
+			v.UpdatedAt = s.now()
+			if e := tx.Set(s.video(v.ID), v); e != nil {
+				return e
+			}
 		}
-		v, e := decodeVideo(selected)
-		if e != nil {
-			return e
+		// Readiness must leave its eligible candidate reachable by the next
+		// claim, even when a long blocked suffix follows that candidate.
+		if reserve || out == nil {
+			if last == nil {
+				e = tx.Set(cursorRef, map[string]any{})
+			} else {
+				e = tx.Set(cursorRef, map[string]any{"created_at": last.CreatedAt, "video_id": last.ID})
+			}
+			if e != nil {
+				return e
+			}
 		}
-		values, e := s.counterValues(tx)
-		if e != nil {
-			return e
+		delta := map[string]int64{"pending_downloads": -int64(len(oversized))}
+		if out != nil && reserve {
+			until := s.now().Add(lease)
+			out.State = "leased"
+			out.WorkerID = worker
+			out.LeaseUntil = &until
+			out.AttemptCount++
+			out.ReservedSize = out.EstimatedSize
+			out.UpdatedAt = s.now()
+			if e := tx.Set(s.video(out.ID), out); e != nil {
+				return e
+			}
+			delta["pending_downloads"]--
+			delta["reserved_bytes"] = out.ReservedSize
 		}
-		used, reserved := values["used_bytes"], values["reserved_bytes"]
-		if v.EstimatedSize <= 0 || v.EstimatedSize > control.ArtifactBudgetBytes-used-reserved {
-			return control.ErrCapacity
-		}
-		now := s.now()
-		until := now.Add(lease)
-		v.State = "leased"
-		v.WorkerID = worker
-		v.LeaseUntil = &until
-		v.AttemptCount++
-		v.ReservedSize = v.EstimatedSize
-		v.UpdatedAt = now
-		out = v
-		if e = tx.Set(s.video(v.ID), v); e != nil {
-			return e
-		}
-		return s.counterDelta(tx, values, map[string]int64{"reserved_bytes": v.ReservedSize, "pending_downloads": -1})
+		return s.counterDelta(tx, values, delta)
 	})
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	return out, result
+}
+func (s *Store) ClaimVideo(ctx context.Context, worker string, lease time.Duration) (*control.Video, error) {
+	return s.scanDownload(ctx, worker, lease, true)
+}
+func (s *Store) CanDownload(ctx context.Context) (bool, error) {
+	v, e := s.scanDownload(ctx, "", 0, false)
+	if errors.Is(e, control.ErrCapacity) || errors.Is(e, control.ErrNotFound) {
+		return false, nil
+	}
+	return v != nil, e
 }
 func (s *Store) RenewLease(ctx context.Context, id, worker string, d time.Duration) error {
 	return s.owned(ctx, id, worker, func(v *control.Video) error { u := s.now().Add(d); v.LeaseUntil = &u; return nil })
@@ -719,6 +822,9 @@ func (s *Store) CompleteVideo(ctx context.Context, id, worker, path string, actu
 		if v.WorkerID != worker || v.State != "uploading" || v.LeaseUntil == nil || !v.LeaseUntil.After(s.now()) {
 			return control.ErrLeaseNotOwned
 		}
+		if v.ArtifactState == "intent" && v.StoragePath != path {
+			return control.ErrInvalidState
+		}
 		if actual <= 0 || actual > v.ReservedSize {
 			return control.ErrCapacity
 		}
@@ -731,6 +837,7 @@ func (s *Store) CompleteVideo(ctx context.Context, id, worker, path string, actu
 			return control.ErrCapacity
 		}
 		v.State = "completed"
+		v.ArtifactState = "stored"
 		v.StoragePath = path
 		v.ActualSize = actual
 		v.WorkerID = ""
@@ -774,6 +881,9 @@ func (s *Store) RetryVideo(ctx context.Context, id string) error {
 		if e != nil {
 			return e
 		}
+		if v.ArtifactState == "intent" {
+			return control.ErrCapacity
+		}
 		if v.State != "quarantined" && v.State != "error" {
 			return control.ErrInvalidState
 		}
@@ -796,6 +906,14 @@ func (s *Store) RetryVideo(ctx context.Context, id string) error {
 	})
 }
 func (s *Store) releaseInTx(tx *cloudfs.Transaction, counters map[string]int64, v *control.Video, state, msg string, until *time.Time) error {
+	if v.ArtifactState == "intent" {
+		v.State = "error"
+		v.Error = "upload outcome awaits artifact reconciliation"
+		v.WorkerID = ""
+		v.LeaseUntil = nil
+		v.UpdatedAt = s.now()
+		return tx.Set(s.video(v.ID), v)
+	}
 	reservedSize := v.ReservedSize
 	v.State = state
 	v.Error = msg
@@ -1157,6 +1275,14 @@ func (s *Store) deriveSourceStateTx(ctx context.Context, tx *cloudfs.Transaction
 	if total > 0 && normalized+quarantined == total && quarantined > 0 {
 		state = "quarantined"
 	}
+	// A legacy quarantined normalization source has no completion flag.
+	// Raw retry overrides prove that discovery had reached normalization.
+	if _, present := snap.Data()["discovery_complete"]; !present && src.State == "quarantined" && len(overrides) > 0 {
+		src.DiscoveryComplete = true
+	}
+	if (src.Kind == "channel" || src.Kind == "playlist") && !src.DiscoveryComplete {
+		return src, nil
+	}
 	src.State, src.NormalizedCount, src.QuarantinedCount = state, normalized, quarantined
 	if state != "quarantined" {
 		src.Error = ""
@@ -1175,3 +1301,11 @@ func rawStates(raws []*control.RawURL, state string) map[string]string {
 }
 
 func isNotFound(err error) bool { return status.Code(err) == codes.NotFound }
+
+func (s *Store) SetUnknownSizeReservation(size int64) error {
+	if size <= 0 || size > control.ArtifactBudgetBytes {
+		return control.ErrCapacity
+	}
+	s.unknownSizeReservation = size
+	return nil
+}

@@ -1,34 +1,25 @@
-# GCP Migration — Next Steps
+# GCP migration status and next steps
 
-## Verified Phase A work
+Firestore transactions, discovery/normalization workers, Cloud Run execution
+guards, GCS uploads, and Terraform resources are implemented. SQLite remains
+the development adapter and is not suitable for production Cloud Run.
 
-- The GCS uploader is tracked and supports Application Default Credentials, create-only object writes, CRC32C, and duplicate verification.
-- Downloader configuration supports `noop`, `local`, and `gcs` storage.
-- Bounded workers exit successfully when the queue is empty.
-- Master and downloader Docker images are present.
-- Master API errors, downloader non-2xx handling, and SQLite lease ownership and transition checks are hardened.
+The review fixes add compatible worker tools, bounded queue scanning,
+idempotent discovery replay, normalizer lease renewal, subprocess diagnostics,
+and retention accounting with durable upload intents.
+See [operations](operations.md) for behavior and upgrade requirements.
 
-The master is still SQLite-backed. It is for local development only and is **not production-safe on Cloud Run**, whose writable filesystem is ephemeral.
+Before production rollout:
 
-## Immediate next feature: Firestore control plane
+1. Run unit/race tests, the Firestore emulator suite, image smoke checks, and
+   Terraform formatting/validation.
+2. Build and push immutable image digests, then update Terraform inputs.
+3. Drain old executions and upgrade the master and workers together, including
+   the master's GCS metadata permission.
+4. Review legacy orphaned objects and validate one authorized bounded end-to-end
+   batch in GCP, including ownership recovery and retention accounting.
 
-First define the master storage interface, preserving the SQLite adapter for local use. Then implement Firestore-backed source, video, worker, lease, and execution-guard operations with transaction tests. Video documents remain deduplicated by `youtube_id`; claims and all lease-owned mutations must be transactional, and expired leases require explicit recovery.
-
-## Follow-on order
-
-1. Build the normalizer using a fakeable yt-dlp metadata extractor.
-2. Add guarded Cloud Run Job execution control with bounded task count and parallelism.
-3. Add Terraform for Firestore, GCS, Artifact Registry, Cloud Run resources, least-privilege service accounts, and supporting operations resources.
-4. Run one authorized bounded end-to-end batch, including lease-recovery and queue-drain exit checks.
-
-## Required GCS IAM condition
-
-The downloader must have both `storage.objects.create` and `storage.objects.get`. The latter is required because duplicate create failures are verified with `Attrs` before an existing object is accepted. Scope both permissions to artifact objects with a conditional bucket IAM binding such as:
-
-```text
-resource.name.startsWith(
-  "projects/_/buckets/BUCKET_NAME/objects/videos/"
-)
-```
-
-Object creation permission without object read permission does not support idempotent duplicate verification.
+GCS uploader IAM needs `storage.objects.create` and `storage.objects.get` for
+immutable creation and retry integrity checks. Master accounting needs only
+`storage.objects.get`. Both grants are restricted to the artifact `videos/`
+prefix; workers continue accessing Firestore exclusively through the master.
